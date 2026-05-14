@@ -14,6 +14,8 @@ The itch: you have more than one computer on the same network and you want a fri
 - **Graceful disconnect handling.** Peer goes offline → their last-known block stays visible, dimmed, marked offline. Peer comes back → it lights up and resumes syncing. Brief network blips (sub-5 seconds) don't even cause a UI flicker.
 - **Diagnostic logging built in.** Every silent failure in the background mesh writes to `~/.netnotepad/log.txt`. Unhandled crashes write a full report to `~/.netnotepad/last_crash.txt` that you can paste straight into a Claude chat for diagnosis.
 
+<img width="762" height="672" alt="image" src="https://github.com/user-attachments/assets/afbf1478-1475-4b73-9de3-b83a7cdc2adc" />
+
 ## Install and run
 
 Requires Python 3.10 or newer.
@@ -62,6 +64,7 @@ TODO.md                  what's next, what's later, what's verified
 ```
 
 ## Building a standalone Windows .exe
+Yeah this is kind of what you really need straight up so here is a prebuilt .exe to play with https://drive.google.com/file/d/11HWSPNTZeq505zmPGDb993FpBPfQQ6A_/view?usp=sharing
 
 Double-click `build_exe.bat`. It installs PyInstaller if you don't have it, then produces `dist\netnotepad.exe` — a single self-contained binary (about 15-25MB) you can drop anywhere on your PATH. After that, `netnotepad` from any command prompt or Win+R Run dialog just works.
 
