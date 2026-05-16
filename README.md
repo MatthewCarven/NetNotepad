@@ -16,6 +16,8 @@ The itch: you have more than one computer on the same network and you want a fri
 
 <img width="762" height="672" alt="image" src="https://github.com/user-attachments/assets/35615ad0-68ba-4d97-80e9-b9b4af465241" />
 
+Yeah about that screenshot, like you never need it right now but when you do......
+
 ## Windows Binary
 
 https://drive.google.com/file/d/1hko5shsAkPfTts0J9A3PPt7-4QTCRsaR/view?usp=sharing
