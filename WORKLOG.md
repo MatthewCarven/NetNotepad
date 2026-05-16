@@ -358,3 +358,55 @@ Full suite: **41/41 passing** (37 → 41 after the four additions).
 - `netnotepad/log.py` — added `LOG_MAX_BYTES` constant, `_maybe_rotate` helper, integration into `_append`.
 - `tests/test_logging.py` — 4 new tests.
 - `TODO.md` — moved item from Later to Verified with the 2026-05-16 date.
+
+## 2026-05-16 (more housekeeping) - apply remote Deltas to peer.block_text
+
+Picked the second-easiest TODO ("Apply remote Deltas to peer.block_text") off the list while in the mood. The engine had been treating incoming `Delta` messages as a no-op (it updated `last_seen_ts` and `tombstoned` but never touched `block_text`); only `Snapshot` actually updated content. That works fine while the only renderer is Tk — which emits `Snapshot` on every edit via `set_local_text` — but the future terminal renderer will use `engine.insert` / `delete_*` etc., which emit `Delta` directly. Forward-prep.
+
+### Implementation
+
+New module-level helper `_apply_delta_to_peer(peer, delta)` in `netnotepad/engine/__init__.py`. It:
+
+1. Splits the peer's current `block_text` into grapheme clusters using the same `_graphemes` helper as the local `Document` (reusing the regex `\X` splitter — emoji-with-skin-tone, family-of-four, etc. count as single positions, identical to local cursor semantics).
+2. Clamps `pos` to `[0, len(graphemes)]` and `pos + remove` to `[pos, len(graphemes)]` so a malformed or out-of-order Delta can't crash the engine.
+3. Splices in the new content: `graphemes[pos:end] = _graphemes(delta.insert)`.
+4. Joins and writes back to `peer.block_text`, updates `peer.last_edit_ts = delta.ts`.
+
+`_on_remote_message` now handles `Delta`:
+
+```python
+elif isinstance(msg, Delta):
+    if peer.has_received_snapshot:
+        _apply_delta_to_peer(peer, msg)
+    # else: drop. Periodic Snapshot rebroadcast (30s) will reconcile.
+```
+
+The `has_received_snapshot` gate (added earlier today) earns its keep: without authoritative base state, applying a Delta to `""` would build wrong content on an unknown base. In normal operation a Snapshot crosses on the Hello handshake well before any Delta could, so this drop path is exceedingly rare — it's mostly defensive against handshake races on flaky links.
+
+Drift recovery is intentionally simple: when content diverges (we dropped a Delta or applied one out of order), the periodic 30s Snapshot rebroadcast in `_periodic_loop` overwrites `peer.block_text` with the authoritative state. Tighter `seq`-gap detection ("explicitly request a Snapshot when we notice a gap") is still on the TODO under "Periodic snapshot reconciliation" — overkill for a LAN scratchpad right now.
+
+### Tests
+
+9 new tests in `tests/test_network.py`:
+
+- **Unit-style** (no networking, just `_apply_delta_to_peer` directly):
+  - `test_apply_delta_pure_insert` — `pos=5, remove=0, insert=" big"` on `"hello world"` → `"hello big world"`.
+  - `test_apply_delta_pure_delete` — `pos=5, remove=4, insert=""` removes `" big"`.
+  - `test_apply_delta_replace` — `pos=6, remove=3, insert="BIG"` swaps `"big"` for `"BIG"`.
+  - `test_apply_delta_clamps_out_of_bounds_pos` — `pos=999` clamps to end, behaves as append.
+  - `test_apply_delta_clamps_out_of_bounds_remove` — `remove=999` clamps to end, doesn't run off.
+  - `test_apply_delta_is_grapheme_aware` — uses a U+1F468 ZWJ U+1F469 ZWJ U+1F467 ZWJ U+1F466 family-of-four emoji (one grapheme cluster, seven code points). Deleting at `pos=1` removes the family even though it's seven code points long.
+
+- **Engine-level** (real `NetNotepad` instance, no networking):
+  - `test_on_remote_message_drops_delta_before_snapshot` — peer with `has_received_snapshot=False` ignores a Delta entirely; `block_text` stays `""`.
+  - `test_on_remote_message_applies_delta_after_snapshot` — receive Snapshot, then a Delta builds on top of it correctly.
+
+- **End-to-end LAN**:
+  - `test_delta_propagates_to_peer_via_engine_insert` — two real `NetNotepad` engines on randomized ports. A primes with `set_local_text("hello")` (Snapshot), waits for B to receive it, then calls `a.move_cursor(0, 5); a.insert(" world")` which goes through the `Delta` path. Verifies B sees `"hello world"`. Skips gracefully if zeroconf/TCP can't propagate in the environment.
+
+Full suite: **50/50 passing** (41 → 50, +9 for Delta application).
+
+### Files touched
+- `netnotepad/engine/__init__.py` — added `_graphemes` import, `_apply_delta_to_peer` module-level helper, `Delta` branch in `_on_remote_message`.
+- `tests/test_network.py` — 9 new tests in three groups (unit, engine-level, end-to-end LAN).
+- `TODO.md` — moved item from Later to Verified.

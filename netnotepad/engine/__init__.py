@@ -27,7 +27,7 @@ from netnotepad.engine.discovery import (
     DiscoveredPeer,
     MESH_PORT,
 )
-from netnotepad.engine.document import Cursor, Document
+from netnotepad.engine.document import Cursor, Document, _graphemes
 from netnotepad.engine.network import Mesh
 from netnotepad.log import log_exception, log_info, set_log_dir
 from netnotepad.protocol import Delta, Goodbye, Heartbeat, Hello, Snapshot
@@ -66,6 +66,28 @@ class Peer:
     # Snapshot whose content was "") from "we haven't heard their content
     # yet" (zeroconf saw them but no Snapshot has crossed the wire).
     has_received_snapshot: bool = False
+
+
+def _apply_delta_to_peer(peer: "Peer", delta: Delta) -> None:
+    """Apply an incoming Delta to a peer's block_text using grapheme indexing.
+
+    Bounds are clamped — a malformed or out-of-order Delta can't crash the
+    engine. If applied to wrong base state (e.g., we missed a prior Delta),
+    the result will diverge from the sender's text; the periodic Snapshot
+    rebroadcast every PERIODIC_REBROADCAST_INTERVAL seconds is the
+    eventual-consistency catch-up.
+
+    Reuses the same `_graphemes` splitter as the local Document so cursor
+    semantics are byte-for-byte consistent between local edits and
+    incoming remote ops (emoji with skin-tone modifier = 1 position, etc.).
+    """
+    graphemes = _graphemes(peer.block_text)
+    pos = max(0, min(delta.pos, len(graphemes)))
+    end = max(pos, min(pos + delta.remove, len(graphemes)))
+    insert_graphemes = _graphemes(delta.insert) if delta.insert else []
+    graphemes[pos:end] = insert_graphemes
+    peer.block_text = "".join(graphemes)
+    peer.last_edit_ts = delta.ts
 
 
 class NetNotepad:
@@ -293,6 +315,17 @@ class NetNotepad:
                 peer.block_text = msg.content
                 peer.last_edit_ts = msg.ts
                 peer.has_received_snapshot = True
+            elif isinstance(msg, Delta):
+                # Only apply if we already have authoritative base state.
+                # Without a prior Snapshot, applying a Delta to "" would
+                # build wrong content on an unknown base; drop it and the
+                # periodic Snapshot rebroadcast (every 30s) will sync us
+                # up. In normal operation Snapshot crosses on the Hello
+                # handshake well before any Delta would, so this drop
+                # path is exceedingly rare — it's mostly defensive
+                # against handshake races on flaky links.
+                if peer.has_received_snapshot:
+                    _apply_delta_to_peer(peer, msg)
             elif isinstance(msg, Goodbye):
                 peer.tombstoned = True
         for cb in self.on_peer_changed:

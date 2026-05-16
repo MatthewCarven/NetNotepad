@@ -183,6 +183,193 @@ def test_tombstone_fires_after_grace_when_no_reconnect(tmp_path):
         e.shutdown()
 
 
+# ---------------------------------------------------------------------------
+# Delta application — unit tests for _apply_delta_to_peer.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_delta_pure_insert():
+    from netnotepad.engine import Peer, _apply_delta_to_peer
+    from netnotepad.protocol import Delta
+
+    peer = Peer(hostname="x", block_text="hello world")
+    _apply_delta_to_peer(peer, Delta(pos=5, remove=0, insert=" big", seq=1, ts=1.0))
+    assert peer.block_text == "hello big world"
+    assert peer.last_edit_ts == 1.0
+
+
+def test_apply_delta_pure_delete():
+    from netnotepad.engine import Peer, _apply_delta_to_peer
+    from netnotepad.protocol import Delta
+
+    peer = Peer(hostname="x", block_text="hello big world")
+    _apply_delta_to_peer(peer, Delta(pos=5, remove=4, insert="", seq=1, ts=2.0))
+    assert peer.block_text == "hello world"
+
+
+def test_apply_delta_replace():
+    from netnotepad.engine import Peer, _apply_delta_to_peer
+    from netnotepad.protocol import Delta
+
+    peer = Peer(hostname="x", block_text="hello big world")
+    _apply_delta_to_peer(peer, Delta(pos=6, remove=3, insert="BIG", seq=1, ts=3.0))
+    assert peer.block_text == "hello BIG world"
+
+
+def test_apply_delta_clamps_out_of_bounds_pos():
+    """A pos past the end should clamp to end (append behavior) rather
+    than crash. The result diverges from the sender; the next Snapshot
+    rebroadcast reconciles."""
+    from netnotepad.engine import Peer, _apply_delta_to_peer
+    from netnotepad.protocol import Delta
+
+    peer = Peer(hostname="x", block_text="abc")
+    _apply_delta_to_peer(peer, Delta(pos=999, remove=0, insert="X", seq=1, ts=1.0))
+    assert peer.block_text == "abcX"
+
+
+def test_apply_delta_clamps_out_of_bounds_remove():
+    """A remove that runs past the end should clamp to end, not crash."""
+    from netnotepad.engine import Peer, _apply_delta_to_peer
+    from netnotepad.protocol import Delta
+
+    peer = Peer(hostname="x", block_text="abc")
+    _apply_delta_to_peer(peer, Delta(pos=1, remove=999, insert="", seq=1, ts=1.0))
+    assert peer.block_text == "a"
+
+
+def test_apply_delta_is_grapheme_aware():
+    """Position arithmetic counts grapheme clusters, not code points.
+    A family-of-four emoji is one cluster even though it's 4 code points
+    joined by 3 zero-width joiners."""
+    from netnotepad.engine import Peer, _apply_delta_to_peer
+    from netnotepad.engine.document import _graphemes
+    from netnotepad.protocol import Delta
+
+    fam = "\U0001f468‍\U0001f469‍\U0001f467‍\U0001f466"
+    peer = Peer(hostname="x", block_text="A" + fam + "B")
+    assert _graphemes(peer.block_text) == ["A", fam, "B"]
+    _apply_delta_to_peer(
+        peer, Delta(pos=1, remove=1, insert="", seq=1, ts=1.0)
+    )
+    assert peer.block_text == "AB"
+
+
+def test_on_remote_message_drops_delta_before_snapshot(tmp_path):
+    """A Delta arriving before any Snapshot from a peer must be ignored.
+    Applying it to an unknown base would build wrong content; the next
+    Snapshot (via 30s periodic rebroadcast or sooner) reconciles."""
+    from netnotepad.engine import Peer
+    from netnotepad.protocol import Delta
+
+    e = NetNotepad(
+        data_dir=tmp_path,
+        mesh_port=0,
+        attach_port=0,
+        instance_name="netnotepad-test-drop-delta",
+    )
+    try:
+        e.peers["mystery"] = Peer(
+            hostname="mystery", has_received_snapshot=False
+        )
+        e._on_remote_message(
+            "mystery", Delta(pos=0, remove=0, insert="hi", seq=1, ts=1.0)
+        )
+        assert e.peers["mystery"].block_text == "", (
+            "Delta should have been dropped because no Snapshot has arrived"
+        )
+        assert e.peers["mystery"].has_received_snapshot is False
+    finally:
+        e.shutdown()
+
+
+def test_on_remote_message_applies_delta_after_snapshot(tmp_path):
+    """Once a Snapshot has arrived, subsequent Deltas update block_text."""
+    from netnotepad.protocol import Delta, Snapshot
+
+    e = NetNotepad(
+        data_dir=tmp_path,
+        mesh_port=0,
+        attach_port=0,
+        instance_name="netnotepad-test-apply-delta",
+    )
+    try:
+        e._on_remote_message(
+            "other", Snapshot(content="hello", seq=1, ts=1.0)
+        )
+        assert e.peers["other"].block_text == "hello"
+        assert e.peers["other"].has_received_snapshot is True
+
+        e._on_remote_message(
+            "other", Delta(pos=5, remove=0, insert=" world", seq=2, ts=2.0)
+        )
+        assert e.peers["other"].block_text == "hello world"
+        assert e.peers["other"].last_edit_ts == 2.0
+    finally:
+        e.shutdown()
+
+
+def test_delta_propagates_to_peer_via_engine_insert(tmp_path):
+    """End-to-end: A.engine.insert() emits a Delta over the wire; B's
+    mirror of A's block should pick it up. Tk's set_local_text path
+    emits Snapshots, but engine.insert emits Deltas directly — this
+    test exercises the same path the future terminal renderer will use."""
+
+    a = NetNotepad(
+        data_dir=tmp_path / "a",
+        mesh_port=0,
+        attach_port=0,
+        instance_name="netnotepad-test-delta-a",
+    )
+    b = NetNotepad(
+        data_dir=tmp_path / "b",
+        mesh_port=0,
+        attach_port=0,
+        instance_name="netnotepad-test-delta-b",
+    )
+    try:
+        a.set_local_text("hello")
+        ta = threading.Thread(target=a.start_networking)
+        tb = threading.Thread(target=b.start_networking)
+        ta.start()
+        tb.start()
+        ta.join(timeout=10)
+        tb.join(timeout=10)
+
+        discovered = _wait_for(
+            lambda: b.hostname in a.peers and a.hostname in b.peers,
+            timeout=6.0,
+        )
+        if not discovered:
+            pytest.skip("zeroconf didn't propagate in this environment")
+
+        snap_arrived = _wait_for(
+            lambda: b.peers.get(a.hostname) is not None
+            and b.peers[a.hostname].block_text == "hello",
+            timeout=8.0,
+        )
+        if not snap_arrived:
+            pytest.skip("mesh handshake didn't complete in this environment")
+
+        a.move_cursor(0, 5)
+        a.insert(" world")
+
+        propagated = _wait_for(
+            lambda: b.peers[a.hostname].block_text == "hello world",
+            timeout=5.0,
+        )
+        assert propagated, (
+            "Delta did not propagate; B sees "
+            + repr(b.peers[a.hostname].block_text)
+        )
+    finally:
+        for e in (a, b):
+            try:
+                e.shutdown()
+            except Exception:
+                pass
+
+
 def test_initial_snapshot_on_connect(tmp_path):
     """A peer that comes online AFTER another already has content should
     receive that content as part of the connection-handshake snapshot."""
