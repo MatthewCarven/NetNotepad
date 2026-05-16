@@ -61,6 +61,11 @@ class Peer:
     last_edit_ts: float = 0.0
     block_text: str = ""
     tombstoned: bool = False
+    # True once we've actually received a Snapshot from this peer. Lets the
+    # renderer distinguish "peer has an explicitly empty block" (received a
+    # Snapshot whose content was "") from "we haven't heard their content
+    # yet" (zeroconf saw them but no Snapshot has crossed the wire).
+    has_received_snapshot: bool = False
 
 
 class NetNotepad:
@@ -287,6 +292,7 @@ class NetNotepad:
             if isinstance(msg, Snapshot):
                 peer.block_text = msg.content
                 peer.last_edit_ts = msg.ts
+                peer.has_received_snapshot = True
             elif isinstance(msg, Goodbye):
                 peer.tombstoned = True
         for cb in self.on_peer_changed:

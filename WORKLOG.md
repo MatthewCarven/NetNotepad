@@ -190,3 +190,145 @@ Edge cases handled:
 
 ### Files touched
 - `netnotepad/renderer/tk_renderer.py` — two `Frame` wrappers + two `Scrollbar` widgets + `yview` save/restore in `refresh_peers_view`. ~25 added lines.
+
+## 2026-05-16 (later still) - surgical per-peer peers-pane updates
+
+The sticky-scroll from earlier (saving `yview()[0]` as a fraction across the wipe-and-rebuild) helped, but it still jumped a bit because the fraction is content-relative: as soon as content above the viewport grows or shrinks (any peer typing), the same fraction now points to a different spot. Matthew correctly diagnosed the underlying problem — we were redrawing things that hadn't changed.
+
+### The fix: don't redraw what didn't change
+
+Refactor `refresh_peers_view` from "wipe the pane, rebuild everything" to "diff and patch":
+
+- **Each peer's section is bracketed by two Tk marks** — `__peer_start_<hostname>` with left gravity, `__peer_end_<hostname>` with right gravity. Marks are positions in a Text widget that Tk auto-shifts as content is inserted or deleted *around* them. Left-gravity on start means inserts at that position go to its right; right-gravity on end means inserts at that position go to its left. Net effect: we can `delete(start_mark, end_mark)` and reinsert content, and the brackets re-bracket the new content correctly. More importantly: when peer A's section is rewritten, the start/end marks of peers B and C automatically adjust their absolute line numbers to keep pointing at the same content — without us touching their sections at all.
+
+- **Per-peer fingerprint cache** — for each peer we record a tuple `(address, last_edit_ts, last_seen_ts, tombstoned, block_text)`. On refresh, if a peer's current fingerprint matches the cached one, that peer's section is left completely untouched.
+
+- **Viewport-top anchor mark** — before any surgical updates, set a mark `__viewport_top` at `index("@0,0")`. Tk's mark adjustment means that even if content above the viewport changes size, this mark continues to point at the same content. After updates, `yview("__viewport_top")` scrolls so that content is back at the top.
+
+### Dispatch
+
+`refresh_peers_view` now branches:
+
+- **Surgical path** (the common case — peer set and sort order unchanged): only redraw sections whose fingerprint changed. If nothing changed at all, it's a no-op.
+- **Full-rebuild path**: a peer joined, left, or got reordered. Falls back to `_full_rebuild_peers_view`, which is essentially the old wipe-and-rebuild but with the per-peer-anchor sticky-scroll logic from the earlier round (capture which peer was at the top + line offset before the wipe; after the rebuild, scroll to that peer's new header + offset).
+
+Initial paint goes through the full-rebuild path explicitly (replacing the bare `refresh_peers_view()` call before `mainloop`), so the "no peers yet" placeholder draws on startup and the section marks get created for any peers already present.
+
+### What this means for daily use
+
+Steady-state behaviour with three peers on the LAN:
+
+- Peer A types one character → Peer A's section gets `delete + reinsert`, body content morphs in place. Peers B and C's sections are not touched at all (no delete, no insert, no tag operations). The viewport is rock-still.
+- Peer B comes online → falls into full-rebuild path. One-time sticky-scroll restore: the user stays anchored to whoever they were reading.
+- A spurious peer event with no actual content change (e.g. a discovery refresh that didn't change address/edit-time/text) → fingerprint matches, refresh is a complete no-op.
+
+The only case that still produces a visible movement is the peer the user is *directly reading* changing the line they're anchored to — and that's unavoidable, you can't anchor to content that's being rewritten under your nose.
+
+### Helper functions extracted to module level
+
+- `_peer_fingerprint(p)` — the dirty-check tuple.
+- `_format_peer_section(p)` — builds `(header_line, body, head_tag, body_tag)`. Previously inline in the loop; now shared between the surgical path and `_full_rebuild_peers_view` to keep the rendering single-sourced.
+
+### Tests
+
+`pytest -q`: **37/37 passing**. The renderer isn't covered by tests (it's UI/event-loop code), so the test count is just confirming nothing else regressed; `py_compile` clean.
+
+### Files touched
+- `netnotepad/renderer/tk_renderer.py` — refactored `refresh_peers_view`, added `_full_rebuild_peers_view`, extracted `_peer_fingerprint` and `_format_peer_section` to module level, added per-peer state dicts. Final file ~440 lines (was ~280).
+
+## 2026-05-16 (debugging) - peer-section boundary fix
+
+Three-machine LAN test surfaced a real bug in the surgical-update refactor above: with two other peers visible, the bottom pane started cycling between them — peer A's section visible for ~1 second, then peer B's, never both together.
+
+### Diagnosis
+
+The bug was at the boundary between consecutive peers' bracket marks.
+
+Old peer-section layout (per `_format_peer_section`): header + body where body ended with `"\n\n"`. After inserting peer A's full section, `end_mark_A` was set at `"end-1c"`. The loop then moved to peer B, set `start_mark_B` at `"end-1c"` again — **the same buffer position** as `end_mark_A`.
+
+End and start marks coinciding on a single buffer index is the failure mode. Walk through what happened on a surgical update for peer A:
+
+1. `delete(start_mark_A, end_mark_A)` — peer A's content removed; `start_mark_A` and `end_mark_A` collapse to the same position. `start_mark_B` was already at that position, so all three coincide.
+2. `insert(start_mark_A, new_header_A)` — content inserted at that position. Tk applies gravity:
+   - `start_mark_A` has **left** gravity → stays on the left, new content goes right. ✓
+   - `end_mark_A` has **right** gravity → moves to the right of the new content. ✓
+   - `start_mark_B` has **left** gravity → stays on the left, new content goes right. **❌**
+3. After the insert, `start_mark_B` is now sitting *before* peer A's new content. Peer B's bracket (`start_mark_B`..`end_mark_B`) now visually envelops peer A's new section as well as peer B's original content.
+4. Next time peer B's fingerprint changes, `delete(start_mark_B, end_mark_B)` wipes peer A's section as collateral. Peer A vanishes; only peer B is visible.
+5. Then peer A types again and the bracket dance flips the other way. Result: alternating display.
+
+### Fix
+
+Insert a `"\n"` separator **between** peer sections, **outside** the brackets, so `end_mark_X` and `start_mark_(X+1)` are at distinct buffer positions. Now an insert at `end_mark_X`'s position only affects `end_mark_X` (the only mark at that position), and `start_mark_(X+1)` is one character further along and uninvolved.
+
+Two changes to `tk_renderer.py`:
+
+- `_format_peer_section` now returns body terminated with a single `"\n"` (was `"\n\n"`). The blank-line visual separator between peers is no longer carried by the body — it's added explicitly.
+- In `_full_rebuild_peers_view`'s per-peer loop, after setting `end_mark` with right gravity, do `peers_view.insert("end", "\n")` — this is the inter-section separator. It lives outside the brackets so it survives surgical updates untouched (every redraw is bounded by `start_mark`..`end_mark` which doesn't include the separator).
+
+The surgical path itself didn't need any change — once the marks are at distinct positions, the existing `delete(start, end)` + `insert(start, header)` + `insert(end, body)` sequence works as intended.
+
+### Visual layout (unchanged for the user)
+
+Each peer's section still shows as: a header line, the body content (one or more lines), then a blank line before the next peer's header. The blank line is just sourced from a different place in the code now.
+
+### Validation
+
+- `pytest -q`: 37/37 passing (renderer is not under test, so this just confirms nothing else regressed).
+- `py_compile` clean.
+- Live two-/three-machine LAN re-test pending — couldn't be exercised in the Cowork sandbox because the Linux container has no Tkinter and no display server.
+
+### Files touched
+- `netnotepad/renderer/tk_renderer.py` — two small targeted edits: body terminator in `_format_peer_section`, separator insert in `_full_rebuild_peers_view`'s peer loop.
+
+## 2026-05-16 (still debugging) - drop end_mark; track content length
+
+The boundary-separator fix above (v1) didn't fully resolve the cycling — three-machine LAN re-test showed it now cycled "differently but still cycles." Diagnosis on the second look:
+
+### Why v1 wasn't enough
+
+The previous design kept a right-gravity `end_mark` per peer, set at `"end-1c"` after inserting the peer's header + body. v1 then did `peers_view.insert("end", "\n")` to drop a separator outside the section brackets.
+
+The problem: at the moment of that separator insert, `end_mark` was *at the same buffer position* as the insert target. Tk normalizes `insert("end", ...)` to "insert just before the trailing newline" — which is exactly where `end-1c` is. With right gravity, `end_mark` got dragged forward past the separator, landing on the new `end-1c`. The next peer's `start_mark` was then set at `end-1c` and ended up at the SAME position as the previous peer's `end_mark`. Coinciding mark indices is the bug we were trying to avoid — separator or no separator, the gravity drift put them back in conflict.
+
+### v2 fix: kill end_mark
+
+Replace `(start_mark, end_mark)` with `(start_mark, content_len)`. Only one mark per peer (left gravity, anchored to the start of the section). End-of-section is computed on demand as `peers_view.index(f"{start_mark} + {content_len}c")` — a derived index, not a mark. Derived indices can't drift because they're recomputed on each operation.
+
+`peer_section_marks` is now `dict[str, tuple[str, int]]`. Surgical update becomes:
+
+1. `end_idx = peers_view.index(f"{start_mark} + {old_content_len}c")` — derived position of the section's current end.
+2. `delete(start_mark, end_idx)` — wipe the section.
+3. `insert(start_mark, header, head_tag)` — start_mark stays put (left gravity), header goes to its right.
+4. `insert(f"{start_mark} + {len(header)}c", body, body_tag)` — body lands immediately after the freshly-inserted header, before the separator that lives just past it.
+5. Update `peer_section_marks[hostname] = (start_mark, len(header) + len(body))`.
+
+With only one mark per peer, the boundary between sections can't be made worse by mark drift. The separator is still inserted after each section (preserving the visual blank line); it's now structurally important because without it the next peer's `start_mark` and the current peer's start_mark + content_len index would coincide, and we'd be back to having two marks at the same index.
+
+### Tests
+
+- `pytest -q`: 37/37 passing.
+- `py_compile` clean.
+- Live three-machine LAN re-test pending — that's the real verification.
+
+### Files touched
+- `netnotepad/renderer/tk_renderer.py` — middle of the file rewritten to swap `(start_mark, end_mark)` for `(start_mark, content_len)`, with the surgical loop and `_full_rebuild_peers_view`'s anchor capture / mark unset both updated to match. Module-level docstring updated to describe the single-mark scheme.
+
+## 2026-05-16 (postscript) - false alarm + defensive logging
+
+Three-machine LAN re-test came back: "both clients show but one client's text is missing." Initially suspected the surgical-update refactor again — added a defensive try/except around the surgical insert loop with a full-rebuild fallback on any `tk.TclError`, plus `log_exception` with context `tk.surgical_update[<hostname>]` so any failure would land in `~/.netnotepad/log.txt` with the offending peer.
+
+Matthew's log showed zero `tk.surgical_update` entries — just network-level `mesh.connect` timeouts to one specific peer (the desktop, IP 10.0.0.2). Followup conversation confirmed: the desktop's network card had been temporarily disabled. So zeroconf still announced the peer (mDNS UDP coming through some path; possibly cached or via a different interface), the renderer created its peer entry, but the TCP mesh never completed a handshake → no `Snapshot` exchanged → `block_text` stayed `""`. The renderer faithfully substituted the `"(empty)"` placeholder from `_format_peer_section`'s `(p.block_text or "(empty)") + "\n"` rule. Visually identical to "text missing."
+
+No renderer bug. The single-mark / content-len rewrite is correct. The surgical update path stays in place.
+
+### Defensive logging kept
+
+The try/except around the surgical insert (with the full-rebuild fallback if it ever fires) is staying in. Cheap insurance: if Tk ever does throw mid-section in some future scenario, we don't leave a torn render on screen, and the offending peer ends up in the log under a known context tag.
+
+### Open UX nit (not done)
+
+The `"(empty)"` placeholder is currently shown for two different states: "peer has an empty block" and "we've never received any block_text from this peer." Distinguishing them would mean adding `has_received_snapshot: bool` to the Peer dataclass and rendering `"(no content received yet)"` vs `"(empty)"` accordingly. Worth doing eventually so this kind of debugging doesn't take a detour through "is the renderer broken?" — but not urgent.
+
+### Files touched
+- `netnotepad/renderer/tk_renderer.py` — wrapped the per-peer surgical update in `try/except tk.TclError`, with `log_exception(..., context=f"tk.surgical_update[{p.hostname}]")` and a `surgical_failed` flag that triggers `_full_rebuild_peers_view(peers)` after the loop. Added a `break` out of the surgical loop on first failure so we don't keep stacking corruptions.
