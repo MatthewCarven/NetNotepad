@@ -122,3 +122,71 @@ Full suite green: 16 document, 7 discovery, 5 network (incl. 2 new grace), 9 log
 Expanded `.gitignore` to cover PyInstaller artifacts (`build/`, `dist/`, `*.spec`), pytest cache, IDE droppings, OS junk (Thumbs.db, .DS_Store, $RECYCLE.BIN), and the runtime files netnotepad writes if you ever run it from the repo dir (`mine.txt`, `log.txt`, `last_crash.txt`).
 
 Matthew is about to push the repo somewhere public, so this seemed like a good moment to make sure we're not committing any of that.
+
+### README.md + LICENSE.md
+
+Added a GitHub-facing `README.md`: tagline + "the itch" motivation, features list, install/run (`pip install regex zeroconf` + `python -m netnotepad`, or double-click `start.bat`), how-it-works summary (engine/renderer split, lex-ordered mesh, 5s heartbeat / 25s watchdog), project layout tree, Windows .exe build instructions (double-click `build_exe.bat`, drop in `%USERPROFILE%\bin`, NOT `C:\Windows`), test count (37 passing), license pointer, acknowledgements (credits Claude/Cowork and notes `error_handler.py` came from a separate Cowork session).
+
+License link points at `LICENSE.md` (uppercase, `.md`) to match the YPilot license file Matthew is copying in.
+
+End-of-day state: 37/37 tests passing, repo ready for `git init` + public push.
+
+## 2026-05-16 - resync vendored error_handler.py
+
+The standalone `error_handler.py` at the project root grew quite a bit since the original vendoring (Matthew kept iterating on it in a separate Cowork session). The vendored copy at `netnotepad/error_handler.py` was now ~731 lines behind the 1374-line standalone. None of it was breaking the running app — `netnotepad/log.py` only calls `describe_error(exc).to_string()` and `describe_error(exc, include_locals=True).for_claude()`, and the two kwargs it uses (`exc`, `include_locals`) have identical semantics in both versions — but the newer features were worth picking up.
+
+### What landed in the vendored copy
+
+Copied root `error_handler.py` over `netnotepad/error_handler.py` verbatim, then patched the docstring (corrected the import-path example to `from netnotepad.error_handler import describe_error`, removed a stale `(stub)` parenthetical on the `for_claude` line, and re-added the "this is a copy of the standalone, keep them in sync" footer that the vendored copy carries).
+
+New capabilities the running app now inherits without any changes to `log.py`:
+
+- **Source-context windows** — every traceback frame in both `to_string()` and `for_claude()` now gets a 7-line window (3 lines either side of the error line), dedented for legibility, with line numbers and a `>>` marker on the error line itself. Massive readability win for crash dumps.
+- **Caller context** — frames *above* the catch site are walked and rendered too, nearest-to-oldest, with the same source-context treatment. Capped at 32 frames with a truncation marker.
+- **ExceptionGroup support** — proper handling of Python 3.11+ `BaseExceptionGroup` (and the 3.10 `exceptiongroup` backport via duck-typing). Each child exception gets full introspection, with cycle and nesting-depth guards.
+- **Environment snapshot** — Python version, platform, system, machine, cwd, pid, argv, executable. Renders into the heavy/for_claude edition as an `ENVIRONMENT` block.
+- **Redaction subsystem** — `register_redactor()`, `redact_pattern()`, `clear_redactors()` public helpers + an internal `_redact` that runs on every captured string (locals, source, messages, args reprs, notes, env-var values). ContextVar-based so concurrent `describe_error` calls don't stomp on each other. Not wired up to anything yet — available for future use.
+- **`redactors=`, `caller_context=`, `max_caller_frames=`, `max_group_depth=`, `environment_snapshot=`, `env_vars=`, `source_context_lines=` kwargs** — all optional, all defaulting on (except redactors and env_vars), so no `log.py` change needed to benefit.
+
+### Tests
+
+`pytest -q` from project root: **37/37 passing** in ~13s. No test changes needed — the vendored module's public surface (`describe_error`, `ErrorReport`) is a strict superset of what it was before, and all existing kwargs behave identically.
+
+### Smoke-tested live
+
+Wrote a tiny script that raises through a two-frame call chain (`deep` → `shallow` → `int("not a number")`), caught it, ran `describe_error(e).to_string()`. Confirmed the output now includes:
+
+- Source-context windows under each traceback frame, with `>>` on the error line.
+- A `Caller context` block showing the frame above the catch.
+
+Older crash output was the bare three-line traceback; new crash output gives the LLM (or you) the surrounding code on every frame. Worth the resync.
+
+### Files touched
+- `netnotepad/error_handler.py` — 731 → 1378 lines (full replacement + docstring patch).
+- Project-root `error_handler.py` left untouched (it's the source of truth).
+- `netnotepad/log.py` — **no changes**. The new richer output is purely additive on defaults.
+
+## 2026-05-16 (later) - sticky vertical scrollbars on Tk panes
+
+Matthew asked for a vertical scrollbar on the text in netnotepad, and specifically wanted it to be "sticky" — i.e., stay put across updates rather than jumping back to the top whenever a peer's content refreshes.
+
+### What changed in `tk_renderer.py`
+
+Both text widgets are now wrapped in a container `Frame` with a `tk.Scrollbar` packed on the right. The scrollbar is wired up via `text.configure(yscrollcommand=scroll.set)` and `Scrollbar(command=text.yview)` in the usual Tk pattern.
+
+- **Editable pane** (top): scrollbar added; no other behavioral change. Tk already preserves scroll position naturally across user edits.
+- **Peers pane** (bottom): scrollbar added, **plus** sticky-scroll logic in `refresh_peers_view()`. Before the `delete("1.0", "end")` that wipes the pane, we capture `peers_view.yview()[0]` (the top-of-viewport as a fraction 0.0..1.0). After rebuilding the content we call `peers_view.yview_moveto(saved_top)` to restore it. Both calls are wrapped in `try/except tk.TclError` for paranoia.
+
+The sticky behaviour matters specifically for the peers pane because `refresh_peers_view()` runs `delete("1.0", "end")` and reinserts everything from scratch on every peer event (Snapshot, Delta, tombstone, peer join/leave). Without the save/restore, the viewport would jump back to the top whenever any peer typed a character — actively annoying when you're trying to read what someone wrote three peers down.
+
+Edge cases handled:
+- **Content shrinks** (peer goes offline, fewer rows than before) — `yview_moveto` clamps to a valid range, no error.
+- **First update before pane is laid out** — `yview()` can raise `tk.TclError` if called before geometry is settled; we catch and default to 0.0.
+- **User scrolled to the very bottom** — they stay at the bottom (because the fraction is whatever the bottom resolves to after rebuild). No special "follow new content" logic — Matthew specifically said "stay where it is", so we just preserve the literal position.
+
+### Tests
+
+`pytest -q` from project root: still **37/37 passing**. No new tests — the Tk renderer is not covered by the existing test suite (it's UI/event-loop code; the engine tests are headless), and adding a Tk-driving test for a behaviour you can verify in two seconds by running the app felt like overengineering for a hobbyist project. Compile-only check: `python -m py_compile netnotepad/renderer/tk_renderer.py` clean.
+
+### Files touched
+- `netnotepad/renderer/tk_renderer.py` — two `Frame` wrappers + two `Scrollbar` widgets + `yview` save/restore in `refresh_peers_view`. ~25 added lines.

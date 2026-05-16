@@ -86,8 +86,10 @@ def run(engine: Any) -> None:
     )
     own_header.pack(side="top", fill="x")
 
+    own_container = tk.Frame(root)
+    own_container.pack(side="top", fill="both", expand=True)
     text = tk.Text(
-        root,
+        own_container,
         undo=True,
         wrap="word",
         font=body_font,
@@ -97,7 +99,10 @@ def run(engine: Any) -> None:
         highlightthickness=0,
         height=12,
     )
-    text.pack(side="top", fill="both", expand=True)
+    own_scroll = tk.Scrollbar(own_container, orient="vertical", command=text.yview)
+    text.configure(yscrollcommand=own_scroll.set)
+    own_scroll.pack(side="right", fill="y")
+    text.pack(side="left", fill="both", expand=True)
     text.focus_set()
 
     initial = engine.document.text
@@ -120,8 +125,10 @@ def run(engine: Any) -> None:
     )
     peers_label.pack(side="top", fill="x")
 
+    peers_container = tk.Frame(root)
+    peers_container.pack(side="top", fill="both", expand=True)
     peers_view = tk.Text(
-        root,
+        peers_container,
         wrap="word",
         font=body_font,
         padx=10,
@@ -132,7 +139,12 @@ def run(engine: Any) -> None:
         state="disabled",
         bg="#fafafa",
     )
-    peers_view.pack(side="top", fill="both", expand=True)
+    peers_scroll = tk.Scrollbar(
+        peers_container, orient="vertical", command=peers_view.yview
+    )
+    peers_view.configure(yscrollcommand=peers_scroll.set)
+    peers_scroll.pack(side="right", fill="y")
+    peers_view.pack(side="left", fill="both", expand=True)
     peers_view.tag_configure(
         "header", font=header_font, foreground="#666", spacing1=6, spacing3=2
     )
@@ -147,6 +159,13 @@ def run(engine: Any) -> None:
     peers_view.tag_configure("empty", foreground="#aaa", font=("Helvetica", 10, "italic"))
 
     def refresh_peers_view() -> None:
+        # Sticky scroll: capture the current top fraction so the viewport stays
+        # put across the wipe-and-rebuild below. yview_moveto clamps if the new
+        # content is shorter, so this is safe in the shrink case too.
+        try:
+            saved_top = peers_view.yview()[0]
+        except tk.TclError:
+            saved_top = 0.0
         peers = engine.sorted_peers()
         peers_view.configure(state="normal")
         peers_view.delete("1.0", "end")
@@ -173,6 +192,10 @@ def run(engine: Any) -> None:
                 peers_view.insert("end", header_line, head_tag)
                 peers_view.insert("end", body, body_tag)
         peers_view.configure(state="disabled")
+        try:
+            peers_view.yview_moveto(saved_top)
+        except tk.TclError:
+            pass
 
     # ---------- debounced save ----------
     pending_save: dict[str, Any] = {"job": None}
