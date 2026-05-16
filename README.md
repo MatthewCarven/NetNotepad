@@ -14,7 +14,13 @@ The itch: you have more than one computer on the same network and you want a fri
 - **Graceful disconnect handling.** Peer goes offline → their last-known block stays visible, dimmed, marked offline. Peer comes back → it lights up and resumes syncing. Brief network blips (sub-5 seconds) don't even cause a UI flicker.
 - **Diagnostic logging built in.** Every silent failure in the background mesh writes to `~/.netnotepad/log.txt`. Unhandled crashes write a full report to `~/.netnotepad/last_crash.txt` that you can paste straight into a Claude chat for diagnosis.
 
-<img width="762" height="672" alt="image" src="https://github.com/user-attachments/assets/afbf1478-1475-4b73-9de3-b83a7cdc2adc" />
+<img width="762" height="672" alt="image" src="https://github.com/user-attachments/assets/35615ad0-68ba-4d97-80e9-b9b4af465241" />
+
+Yeah about that screenshot, like you never need it right now but when you do......
+
+## Windows Binary
+
+https://drive.google.com/file/d/1hko5shsAkPfTts0J9A3PPt7-4QTCRsaR/view?usp=sharing
 
 ## Install and run
 
