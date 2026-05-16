@@ -332,3 +332,29 @@ The `"(empty)"` placeholder is currently shown for two different states: "peer h
 
 ### Files touched
 - `netnotepad/renderer/tk_renderer.py` — wrapped the per-peer surgical update in `try/except tk.TclError`, with `log_exception(..., context=f"tk.surgical_update[{p.hostname}]")` and a `surgical_failed` flag that triggers `_full_rebuild_peers_view(peers)` after the loop. Added a `break` out of the surgical loop on first failure so we don't keep stacking corruptions.
+
+## 2026-05-16 (housekeeping) - log.txt rotation
+
+Picked the easiest TODO item — log rotation — to knock out before the more substantial attachments/terminal-renderer work. `~/.netnotepad/log.txt` was growing unbounded, which is fine for a hobbyist tool used for a few weeks but starts to feel sloppy after months of daily use.
+
+### Implementation
+
+`netnotepad/log.py` gets a new constant `LOG_MAX_BYTES = 1_000_000` (1 MB) and a new helper `_maybe_rotate(log_path)`. The rotation policy is the minimum that's actually useful: single backup, prior backup overwritten on next rotation. This is a breadcrumb trail for post-mortem debugging, not an audit log — the most useful entries are always the most recent. Stacking numbered backups would be tidier-looking but adds complexity for no gain.
+
+`_maybe_rotate` is called under `_LOCK` at the head of `_append`. If `log.txt` is at or past `LOG_MAX_BYTES`: delete any existing `log.1.txt`, rename `log.txt` → `log.1.txt`, then continue with the append (which creates a fresh `log.txt`). Every step is wrapped in try/except OSError so a hostile filesystem mid-rotation can't propagate. `LOG_MAX_BYTES` is exposed as a module attribute so tests can drop it to tiny values via `monkeypatch.setattr` without writing a megabyte.
+
+### Tests
+
+4 new tests in `tests/test_logging.py`, all keyed off `monkeypatch.setattr(log_module, "LOG_MAX_BYTES", 200)`:
+
+- `test_log_rotates_when_over_threshold` — write one bulk entry (500 chars) that pushes the file past the cap; verify rotation has NOT fired yet (the rotation check is BEFORE the write); then write a small marker and verify the bulk entry is now in `log.1.txt` and the marker is alone in a fresh `log.txt`. This subtle "rotation fires on the NEXT write after the cap is exceeded, not the write that crosses it" semantics was the trickiest part — my first version of this test assumed the rotation fired exactly when the cap was crossed and got the assertion bounds wrong.
+- `test_log_rotation_overwrites_prior_backup` — trigger two rounds of rotation (AAAA bulk + marker, then BBBB bulk + marker); verify the final `log.1.txt` contains the BBBB bulk and no AAAA content.
+- `test_log_does_not_rotate_below_threshold` — set the cap to 10 KB, write five short entries; verify `log.1.txt` is never created.
+- `test_log_rotation_is_safe_when_log_does_not_exist_yet` — first-ever log call on a clean directory; the `stat()` failure in `_maybe_rotate` should be caught, the append should proceed normally, and `log.1.txt` should not exist.
+
+Full suite: **41/41 passing** (37 → 41 after the four additions).
+
+### Files touched
+- `netnotepad/log.py` — added `LOG_MAX_BYTES` constant, `_maybe_rotate` helper, integration into `_append`.
+- `tests/test_logging.py` — 4 new tests.
+- `TODO.md` — moved item from Later to Verified with the 2026-05-16 date.

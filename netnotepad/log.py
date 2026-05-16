@@ -49,6 +49,13 @@ _DEFAULT_LOG_DIR = Path.home() / ".netnotepad"
 _LOCK = threading.Lock()
 _LOG_DIR: Optional[Path] = None
 
+# Cap log.txt at this size; on overflow it rolls to log.1.txt and a fresh
+# log.txt starts. One backup only — this is a breadcrumb trail for
+# post-mortem debugging, not an audit log, and the most useful entries are
+# always the most recent ones. Exposed as a module attribute so tests can
+# drop it to a tiny value without writing a megabyte.
+LOG_MAX_BYTES = 1_000_000
+
 
 def set_log_dir(path: Path) -> None:
     """Point the logger at a specific directory. Idempotent."""
@@ -74,14 +81,43 @@ def _ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _maybe_rotate(log_path: Path) -> None:
+    """If ``log_path`` is at or past ``LOG_MAX_BYTES``, roll it to log.1.txt.
+
+    Caller must hold ``_LOCK``. Single backup file — any prior log.1.txt is
+    overwritten. Never raises: a hostile filesystem during rotation (perms,
+    race with antivirus, etc.) just leaves the existing log in place and
+    the next append will fail-soft like every other path here.
+    """
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return
+    if size < LOG_MAX_BYTES:
+        return
+    backup_path = log_path.with_name("log.1.txt")
+    try:
+        if backup_path.exists():
+            backup_path.unlink()
+    except OSError:
+        pass
+    try:
+        log_path.rename(backup_path)
+    except OSError:
+        pass
+
+
 def _append(line: str) -> None:
-    """Append a line to log.txt. Never raises."""
+    """Append a line to log.txt. Never raises. Rotates to log.1.txt if the
+    current log is at or past ``LOG_MAX_BYTES``."""
     dirp = _ensure_dir()
     if dirp is None:
         return
     try:
         with _LOCK:
-            with open(dirp / "log.txt", "a", encoding="utf-8") as f:
+            log_path = dirp / "log.txt"
+            _maybe_rotate(log_path)
+            with open(log_path, "a", encoding="utf-8") as f:
                 f.write(line)
                 if not line.endswith("\n"):
                     f.write("\n")

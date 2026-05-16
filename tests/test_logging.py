@@ -190,3 +190,98 @@ def test_get_log_dir_defaults_when_unset() -> None:
         assert d.name == ".netnotepad"
     finally:
         log_module._LOG_DIR = prev
+
+
+def test_log_rotates_when_over_threshold(
+    log_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once log.txt is at/over LOG_MAX_BYTES, the NEXT append rolls it
+    to log.1.txt and starts a fresh log.txt. The pre-rotation entry
+    lands in the backup; the post-rotation marker is alone in the fresh
+    file."""
+    monkeypatch.setattr(log_module, "LOG_MAX_BYTES", 200)
+
+    log_path = log_dir / "log.txt"
+    backup_path = log_dir / "log.1.txt"
+
+    # One big entry pushes log.txt past the threshold. No rotation yet,
+    # because rotation is checked BEFORE the write — the file was below
+    # the cap when this call started.
+    log_info("X" * 500, context="test.rotate.bulk")
+    assert log_path.exists()
+    assert not backup_path.exists(), (
+        "rotation should not have fired yet; we just crossed the cap"
+    )
+    assert "X" * 500 in log_path.read_text(encoding="utf-8")
+
+    # Now the next append sees log.txt is over the cap and rotates.
+    log_info("after-rotation marker", context="test.rotate.post")
+
+    assert backup_path.exists(), "rotation should have fired this time"
+    new_contents = log_path.read_text(encoding="utf-8")
+    old_contents = backup_path.read_text(encoding="utf-8")
+
+    assert "X" * 500 in old_contents, "big entry should land in backup"
+    assert "after-rotation marker" in new_contents, (
+        "marker should land in the fresh log"
+    )
+    assert "X" * 500 not in new_contents, (
+        "fresh log should not retain pre-rotation content"
+    )
+
+
+def test_log_rotation_overwrites_prior_backup(
+    log_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second rotation replaces the existing log.1.txt rather than
+    appending or accumulating numbered backups. Single-backup policy."""
+    monkeypatch.setattr(log_module, "LOG_MAX_BYTES", 200)
+
+    # First rotation: bulk "AAAA..." entry, then a marker to trigger.
+    log_info("AAAA" * 100, context="test.r1.bulk")
+    log_info("round-1 marker", context="test.r1.marker")
+
+    backup_after_r1 = (log_dir / "log.1.txt").read_text(encoding="utf-8")
+    assert "AAAA" * 100 in backup_after_r1
+
+    # Second rotation: bulk "BBBB..." entry, then a marker. The prior
+    # backup (round 1) should be overwritten, not preserved.
+    log_info("BBBB" * 100, context="test.r2.bulk")
+    log_info("round-2 marker", context="test.r2.marker")
+
+    backup_after_r2 = (log_dir / "log.1.txt").read_text(encoding="utf-8")
+    assert "BBBB" * 100 in backup_after_r2
+    assert "AAAA" * 100 not in backup_after_r2, (
+        "prior backup (round 1) should have been overwritten"
+    )
+
+
+def test_log_does_not_rotate_below_threshold(
+    log_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A handful of short entries well below the cap must NOT rotate."""
+    monkeypatch.setattr(log_module, "LOG_MAX_BYTES", 10_000)
+
+    for i in range(5):
+        log_info("small message " + str(i), context="test.no-rotate")
+
+    assert (log_dir / "log.txt").exists()
+    assert not (log_dir / "log.1.txt").exists(), (
+        "log.1.txt should not exist when we never crossed the threshold"
+    )
+
+
+def test_log_rotation_is_safe_when_log_does_not_exist_yet(
+    log_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """First-ever log line on a fresh system: the rotation check should
+    no-op cleanly (stat fails, threshold not exceeded), and the append
+    proceeds normally."""
+    monkeypatch.setattr(log_module, "LOG_MAX_BYTES", 200)
+    log_info("first ever line", context="test.fresh-start")
+
+    log_path = log_dir / "log.txt"
+    backup_path = log_dir / "log.1.txt"
+    assert log_path.exists()
+    assert not backup_path.exists()
+    assert "first ever line" in log_path.read_text(encoding="utf-8")

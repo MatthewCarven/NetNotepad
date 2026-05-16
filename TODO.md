@@ -15,7 +15,6 @@
 - [ ] Cross-subnet / VPN-friendly discovery (multicast doesn't traverse subnets).
 - [ ] CI matrix that builds Windows / macOS / Linux binaries via PyInstaller on GitHub Actions runners.
 - [ ] Optional: encrypt the mesh channel with a shared LAN passphrase, for users who don't trust their LAN.
-- [ ] Log rotation - `log.txt` grows unbounded today; cap at ~1MB and roll to `log.1.txt`.
 
 ## Verified
 
@@ -26,6 +25,7 @@
 - [x] **2026-05-14** - Diagnostic logging wired in. `error_handler.py` vendored into the package; new `netnotepad/log.py` exposes `log_info` / `log_exception` / `crash_to_file` / `set_log_dir`. Every silent except in the mesh, discovery, document, and Tk layers now routes through `log_exception(e, context=...)` into `~/.netnotepad/log.txt`. `__main__.py` wraps everything in an outer try/except that writes a `for_claude()` heavy report to `~/.netnotepad/last_crash.txt` on any unhandled crash. 9 new tests added in `tests/test_logging.py`. Full suite: 35/35 green.
 - [x] **2026-05-14** - Tombstone grace period (5s) prevents UI flicker on transient network blips. TCP drop schedules a delayed tombstone instead of firing immediately; any inbound traffic during the grace window cancels it. Trade-off: a real disconnect takes ~5s longer to show as offline. Tests `test_tombstone_grace_suppresses_flicker_on_quick_reconnect` and `test_tombstone_fires_after_grace_when_no_reconnect` cover both paths. Full suite: 37/37 green.
 - [x] **2026-05-14** - Windows packaging via PyInstaller. `run.py` entrypoint shim + `build_exe.bat` produces `dist\netnotepad.exe` as a single self-contained binary. Documented PATH placement (personal `%USERPROFILE%\bin`, not `C:\Windows`).
+- [x] **2026-05-16** - Log rotation. `log.txt` capped at 1 MB (`LOG_MAX_BYTES`); on overflow it rolls to `log.1.txt` (single backup, prior backup overwritten). Implemented as `_maybe_rotate()` called under `_LOCK` at the head of `_append`. 4 new tests in `tests/test_logging.py` cover: rotation triggers at threshold, prior backup overwritten on second rotation, no rotation below threshold, no crash when log.txt doesn't exist yet. Full suite: 41/41 green.
 - [x] **2026-05-13** - First two-machine test (Matthew's LAN): instances on ID10TError-Laptop1 and DESKTOP-NM6GRPH discovered each other and exchanged initial snapshots, but live edits didn't propagate. Diagnosed as mDNS-flicker tombstones plus no auto-reconnect post-TCP-drop. Hardening pass applied:
     - Mesh.start() falls back to a kernel-assigned port if the requested one is taken (fixes "doesn't like being run more than once on the same PC").
     - Discovery-driven tombstone is suppressed when the TCP connection is still alive (mDNS flicker no longer marks live peers offline).
