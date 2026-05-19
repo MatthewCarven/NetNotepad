@@ -410,3 +410,53 @@ Full suite: **50/50 passing** (41 → 50, +9 for Delta application).
 - `netnotepad/engine/__init__.py` — added `_graphemes` import, `_apply_delta_to_peer` module-level helper, `Delta` branch in `_on_remote_message`.
 - `tests/test_network.py` — 9 new tests in three groups (unit, engine-level, end-to-end LAN).
 - `TODO.md` — moved item from Later to Verified.
+
+## 2026-05-19 - attachments end-to-end
+
+Pulled `engine/attachments.py` out of stub into the working module it was always meant to be. Attachments are now content-addressed by SHA-256, served out-of-band over a tiny HTTP server on a separate port from the mesh, and referenced inline in our text as `![attachment:<sha>:<filename>]` tokens. The keystroke channel stays keystroke-rate even when someone drops in a 5 MB screenshot - the mesh only carries the small `AttachmentOffer` reference; blob bytes ride urllib over HTTP.
+
+### What got built
+
+- **`AttachmentStore`** - content-addressed blob cache rooted at `~/.netnotepad/attachments/`. `put_bytes(data)` returns sha and writes atomically via temp+rename. `has`/`read`/`size`/`save_to` do what they say. Idempotent on duplicate puts (no rewrite if blob already cached).
+- **`AttachmentServer`** - `ThreadingHTTPServer` on the attachment port. One route: `GET /blob/<sha>` returns 200 with `application/octet-stream`, 404 for unknown/missing-route, 400 for malformed sha. Mirrors the mesh port-fallback story: if requested port is taken, fall back to a kernel-assigned port and expose the actual one via `listen_port` so discovery's TXT record advertises what we actually bound.
+- **`fetch_blob(address, port, sha, store)`** - urllib client that downloads, verifies sha matches, and stashes via the store's atomic put. Refuses to cache on sha mismatch or oversize. 10s socket timeout (LAN-tight; we'd rather fail fast than hang the UI).
+- **`make_attachment_token`** / **`parse_attachment_tokens`** - text-format helpers in one place so the regex doesn't drift between the renderer and the engine. The token regex demands lowercase hex sha to prevent two cosmetically-different tokens collapsing onto the same blob.
+
+### Engine wiring
+
+- `NetNotepad.attachment_store` (public) is created eagerly in `__init__` so `attach_bytes`/`attach_file` work even before `start_networking` - useful for tests and for the "user pastes a file before zeroconf finishes probing" case.
+- `start_networking` boots the `AttachmentServer` before discovery so the TXT record advertises the actually-bound port (not the requested one). `shutdown` tears it down.
+- `Peer` gained `attach_port: int = 0` and `known_attachments: dict[str, AttachmentOffer]`. `attach_port` is captured from the Hello message (authoritative) and from the DiscoveredPeer's TXT record (belt-and-braces).
+- `_on_remote_message` now branches on `Hello` (capture attach_port) and `AttachmentOffer` (record on peer + kick a background prefetch). Prefetch is best-effort; `engine.ensure_attachment(peer_hostname, sha)` is the synchronous retry path the renderer calls on Save-as.
+- `engine.attach_bytes(data, filename)` returns `(sha, token)`. The renderer splices the token into the local Text widget; the `<<Modified>>` handler mirrors the new text back to the engine which broadcasts a Snapshot. The `AttachmentOffer` for the same blob fires immediately on the mesh, independent of the Snapshot, so even if the Snapshot got dropped the receiver still knows the blob is available.
+
+### Tk renderer changes
+
+Minimal v1 surface, kept small on purpose:
+
+- An "Attach file..." button above the editor pane opens `filedialog.askopenfilename`, calls `engine.attach_file(path)`, and inserts the returned token at the cursor.
+- Attachment tokens get a green-underlined tag (`#0a5`) in both panes so the user can see them at a glance, applied after every full peers rebuild, every surgical peer-section update, and every local on_modified.
+- Right-click (Button-3 + Button-2 for old-mac mice) on a token pops a tiny menu with "Save attachment as...". For peer tokens it calls `engine.ensure_attachment(peer_hostname, sha)` first so we'll fetch on demand even if the prefetch raced with Hello.
+
+Image-rendering of inline tokens stays in `TODO.md` "Later" - we render the literal token in v1, which is fine because the green underline makes them visually distinct and Save-as gets the bytes out.
+
+### Tests (75/75 - was 50/50, +25 new)
+
+New `tests/test_attachments.py`:
+
+- **Pure helpers** - token round-trip, token strips dangerous chars (newline, tab, `]`), multiple tokens parse correctly, uppercase-hex sha rejected (would otherwise collapse two tokens onto one blob), mime guess for known/unknown extensions.
+- **Store** - round-trip, idempotent put (mtime unchanged on duplicate), `save_to` copies bytes, `save_to` on missing sha raises FileNotFoundError.
+- **Server + fetch** - serves cached blob with correct bytes, 404 on unknown sha, 400 on malformed sha, 404 on bad route, fetch downloads + verifies, fetch short-circuits on cache hit (proved by passing an unreachable port), fetch returns False on sha mismatch without poisoning the cache, port fallback when requested port is in use.
+- **Engine integration** - `attach_bytes` caches and returns matching token, oversize attach raises ValueError, `attach_file` reads from disk, `_on_remote_message(AttachmentOffer)` records on peer, `_on_remote_message(Hello)` captures attach_port, `ensure_attachment` looks up peer's address+port and fetches, `ensure_attachment` returns False for unknown peer, `ensure_attachment` short-circuits when blob already cached.
+
+### Files touched
+
+- `netnotepad/engine/attachments.py` - replaced stub with the real module (~290 lines).
+- `netnotepad/engine/__init__.py` - imports, `Peer` fields, `start_networking` boots server, `_on_remote_message` Hello + AttachmentOffer branches, new public methods `attach_bytes`/`attach_file`/`ensure_attachment`, internal `_prefetch_attachment`.
+- `netnotepad/renderer/tk_renderer.py` - attach-file button, token tag styling, right-click context menu, retag-after-render helper.
+- `tests/test_attachments.py` - new, 25 tests.
+- `TODO.md` - moved attachments item to Verified.
+
+### Process note
+
+Hit the mount-drift footgun again (it's in memory). Two distinct symptoms this round: (1) the very first `Write` call for `attachments.py` only landed ~10 lines on the bash side, so Python read a truncated file; (2) one of the bigger engine Edits silently failed to land while smaller ones in the same file landed fine - the file's tail got chopped mid-method. Recovery was the documented workaround: rebuild the file via `cat << 'EOF' >` heredoc and verify with `wc -l`. Worth knowing: stale `.pyc` cache files on the Windows side are read-only from the Linux mount, so `find -delete` fails. `PYTHONPYCACHEPREFIX=/tmp/nnpy python -B` works around it cleanly without needing to delete anything.

@@ -17,10 +17,18 @@ from __future__ import annotations
 import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from netnotepad.engine.attachments import (
+    AttachmentServer,
+    AttachmentStore,
+    MAX_ATTACHMENT_BYTES,
+    fetch_blob,
+    guess_mime,
+    make_attachment_token,
+)
 from netnotepad.engine.discovery import (
     ATTACH_PORT,
     Discovery,
@@ -30,7 +38,14 @@ from netnotepad.engine.discovery import (
 from netnotepad.engine.document import Cursor, Document, _graphemes
 from netnotepad.engine.network import Mesh
 from netnotepad.log import log_exception, log_info, set_log_dir
-from netnotepad.protocol import Delta, Goodbye, Heartbeat, Hello, Snapshot
+from netnotepad.protocol import (
+    AttachmentOffer,
+    Delta,
+    Goodbye,
+    Heartbeat,
+    Hello,
+    Snapshot,
+)
 
 
 DEFAULT_DATA_DIR = Path.home() / ".netnotepad"
@@ -66,6 +81,15 @@ class Peer:
     # Snapshot whose content was "") from "we haven't heard their content
     # yet" (zeroconf saw them but no Snapshot has crossed the wire).
     has_received_snapshot: bool = False
+    # Port on which this peer's tiny attachment HTTP server is listening.
+    # Captured from the Hello message (authoritative) and from the
+    # DiscoveredPeer's TXT record (belt-and-braces). 0 means we haven't
+    # learned it yet; the renderer / ensure_attachment will retry later.
+    attach_port: int = 0
+    # Sha -> AttachmentOffer for every attachment this peer has advertised.
+    # Lets the renderer look up filename/size/mime by sha when displaying a
+    # token, and lets ensure_attachment know which peer to fetch from.
+    known_attachments: dict[str, AttachmentOffer] = field(default_factory=dict)
 
 
 def _apply_delta_to_peer(peer: "Peer", delta: Delta) -> None:
@@ -115,6 +139,15 @@ class NetNotepad:
             save_path=self.data_dir / "mine.txt",
             on_change=self._on_local_change,
         )
+
+        # Attachment cache + HTTP server. The store is created eagerly
+        # (cheap; just an mkdir) so attach_bytes / attach_file work even
+        # before start_networking has run - useful for tests and for the
+        # offline-startup case where the user pastes a file before
+        # zeroconf has finished its probe. The server starts in
+        # start_networking once we know the final port.
+        self.attachment_store = AttachmentStore(self.data_dir / "attachments")
+        self._attach_server: Optional[AttachmentServer] = None
 
         self.peers: dict[str, Peer] = {}
         self._peers_lock = threading.RLock()
@@ -183,6 +216,14 @@ class NetNotepad:
         if self._discovery is not None:
             return
 
+        # Start the attachment HTTP server before discovery so we can
+        # advertise the actually-bound port (not the requested one) in
+        # the TXT record. Mirrors the mesh port-fallback story.
+        self._attach_server = AttachmentServer(
+            self.attachment_store, port=self._attach_port
+        )
+        self._attach_server.start()
+
         self._mesh = Mesh(
             our_hostname_provider=lambda: self.hostname,
             local_snapshot_provider=self.local_snapshot,
@@ -195,7 +236,7 @@ class NetNotepad:
         self._discovery = Discovery(
             instance_name=self.hostname,
             mesh_port=self._mesh.listen_port,
-            attach_port=self._attach_port,
+            attach_port=self._attach_server.listen_port,
             on_peer_changed=self._on_peer_discovered,
             on_peer_removed=self._on_peer_undiscovered,
         )
@@ -224,6 +265,9 @@ class NetNotepad:
         if self._discovery is not None:
             self._discovery.stop()
             self._discovery = None
+        if self._attach_server is not None:
+            self._attach_server.stop()
+            self._attach_server = None
         self.document.save()
 
     # ---------- internal: local edit fanout ----------
@@ -265,6 +309,12 @@ class NetNotepad:
                 peer = Peer(hostname=dp.hostname)
                 self.peers[dp.hostname] = peer
             peer.address = dp.address
+            # Belt-and-braces: capture attach_port from the TXT record so
+            # we can fetch blobs even before Hello has crossed the wire.
+            # The authoritative value is the Hello message's attachment_port
+            # (see _on_remote_message); the TXT one is a fallback.
+            if dp.attach_port:
+                peer.attach_port = dp.attach_port
             peer.last_seen_ts = time.time()
             peer.tombstoned = False
         for cb in self.on_peer_changed:
@@ -304,6 +354,7 @@ class NetNotepad:
         # to tombstone immediately, so cancellation here is harmless either
         # way (we re-tombstone below).
         self._cancel_pending_tombstone(peer_hostname)
+        attachment_to_prefetch: Optional[tuple[str, int, str]] = None
         with self._peers_lock:
             peer = self.peers.get(peer_hostname)
             if peer is None:
@@ -311,7 +362,13 @@ class NetNotepad:
                 self.peers[peer_hostname] = peer
             peer.last_seen_ts = time.time()
             peer.tombstoned = False
-            if isinstance(msg, Snapshot):
+            if isinstance(msg, Hello):
+                # Authoritative source for the peer's attach_port. The
+                # TXT record gave us a hint earlier (see
+                # _on_peer_discovered); this is the value we actually
+                # trust for outbound fetches.
+                peer.attach_port = msg.attachment_port
+            elif isinstance(msg, Snapshot):
                 peer.block_text = msg.content
                 peer.last_edit_ts = msg.ts
                 peer.has_received_snapshot = True
@@ -326,6 +383,22 @@ class NetNotepad:
                 # against handshake races on flaky links.
                 if peer.has_received_snapshot:
                     _apply_delta_to_peer(peer, msg)
+            elif isinstance(msg, AttachmentOffer):
+                # Record what's on offer so the renderer can resolve a
+                # token's filename/size/mime when it sees one. Kick a
+                # prefetch outside the lock if we have enough info to
+                # reach the peer's HTTP server. The fetch is best-effort;
+                # ensure_attachment() lets the renderer retry on demand
+                # if the prefetch races with Hello.
+                peer.known_attachments[msg.sha256] = msg
+                if (
+                    peer.address
+                    and peer.attach_port
+                    and not self.attachment_store.has(msg.sha256)
+                ):
+                    attachment_to_prefetch = (
+                        peer.address, peer.attach_port, msg.sha256
+                    )
             elif isinstance(msg, Goodbye):
                 peer.tombstoned = True
         for cb in self.on_peer_changed:
@@ -333,6 +406,95 @@ class NetNotepad:
         if isinstance(msg, Goodbye):
             for cb in self.on_peer_tombstoned:
                 cb(peer)
+        if attachment_to_prefetch is not None:
+            self._prefetch_attachment(*attachment_to_prefetch)
+
+    # ---------- attachments (public) ----------
+
+    def attach_bytes(
+        self, data: bytes, filename: str, mime: Optional[str] = None
+    ) -> tuple[str, str]:
+        """Store ``data`` as an attachment and broadcast its availability.
+
+        Returns ``(sha, token)``. The renderer is expected to splice the
+        token into the local block text at the cursor (the editor itself
+        owns insertion semantics; the engine just hashes, caches, and
+        announces).
+
+        Raises ValueError if the blob exceeds ``MAX_ATTACHMENT_BYTES`` -
+        attach with a smaller payload or refactor to chunked transfers
+        (out of scope for v1).
+        """
+        if len(data) > MAX_ATTACHMENT_BYTES:
+            raise ValueError(
+                "attachment exceeds MAX_ATTACHMENT_BYTES ("
+                + str(len(data)) + " > " + str(MAX_ATTACHMENT_BYTES) + ")"
+            )
+        sha = self.attachment_store.put_bytes(data)
+        token = make_attachment_token(sha, filename)
+        offer = AttachmentOffer(
+            sha256=sha,
+            filename=filename,
+            size=len(data),
+            mime=mime or guess_mime(filename),
+        )
+        if self._mesh is not None:
+            self._mesh.broadcast(offer)
+        return sha, token
+
+    def attach_file(
+        self, path: Path, mime: Optional[str] = None
+    ) -> tuple[str, str]:
+        """Convenience: read ``path`` and call :meth:`attach_bytes`."""
+        p = Path(path)
+        data = p.read_bytes()
+        return self.attach_bytes(data, filename=p.name, mime=mime)
+
+    def ensure_attachment(
+        self, peer_hostname: str, sha: str, timeout: float = 10.0
+    ) -> bool:
+        """Make sure we have the blob for ``sha`` cached locally.
+
+        Looks up the peer's address + attach_port from our peer state and
+        downloads the blob if it's not already cached. Returns True if
+        the blob is available in ``self.attachment_store`` after the
+        call. Used by the renderer when the user clicks "Save attachment
+        as..." on a token that hasn't been auto-prefetched yet.
+        """
+        if self.attachment_store.has(sha):
+            return True
+        with self._peers_lock:
+            peer = self.peers.get(peer_hostname)
+            if peer is None:
+                return False
+            address = peer.address
+            attach_port = peer.attach_port
+        if not address or not attach_port:
+            return False
+        return fetch_blob(
+            address, attach_port, sha, self.attachment_store, timeout=timeout
+        )
+
+    def _prefetch_attachment(
+        self, address: str, port: int, sha: str
+    ) -> None:
+        """Spawn a daemon thread that fetches a blob in the background.
+
+        Called from ``_on_remote_message`` after an AttachmentOffer. The
+        thread is best-effort: failure logs but doesn't surface to the
+        renderer. ``ensure_attachment`` is the synchronous retry path.
+        """
+        def _run() -> None:
+            try:
+                fetch_blob(address, port, sha, self.attachment_store)
+            except Exception as e:
+                log_exception(
+                    e, context="engine.prefetch (" + str(sha) + ")"
+                )
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+    # ---------- internal: mesh disconnect / tombstone-grace ----------
 
     def _on_mesh_disconnect(self, peer_hostname: str) -> None:
         """TCP connection dropped.

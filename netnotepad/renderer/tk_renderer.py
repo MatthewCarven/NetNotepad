@@ -34,10 +34,12 @@ from __future__ import annotations
 import threading
 import time
 import tkinter as tk
-from tkinter import font as tkfont
+from pathlib import Path
+from tkinter import filedialog, font as tkfont
 from typing import Any
 
-from netnotepad.log import log_exception
+from netnotepad.engine.attachments import parse_attachment_tokens
+from netnotepad.log import log_exception, log_info
 
 
 def _format_time(ts: float) -> str:
@@ -155,6 +157,38 @@ def run(engine: Any) -> None:
     )
     own_header.pack(side="top", fill="x")
 
+    # ---- attach toolbar: a single button that opens a file dialog ----
+    def on_attach_clicked() -> None:
+        path = filedialog.askopenfilename(parent=root, title="Attach file")
+        if not path:
+            return
+        try:
+            sha, token = engine.attach_file(path)
+        except (OSError, ValueError) as e:
+            log_exception(e, context="tk.attach_file")
+            set_transient("attach failed: " + str(e))
+            return
+        # Insert the token at the current cursor. The <<Modified>> handler
+        # will mirror the new text back into the engine so the Snapshot
+        # broadcast carries it to peers, in addition to the AttachmentOffer
+        # that engine.attach_file already kicked off.
+        text.insert("insert", token)
+        # Belt-and-braces retag here so the token is highlighted even if
+        # the <<Modified>> chain races with this insert (programmatic
+        # inserts sometimes don't fire <<Modified>> in the order you'd
+        # expect, depending on Tk version).
+        _retag_attachments(text, "1.0", text.get("1.0", "end-1c"))
+        set_transient("attached " + Path(path).name)
+
+    toolbar = tk.Frame(root, bg="#f4f4f4")
+    toolbar.pack(side="top", fill="x")
+    tk.Button(
+        toolbar,
+        text="Attach file...",
+        relief="flat",
+        command=on_attach_clicked,
+    ).pack(side="left", padx=6, pady=2)
+
     own_container = tk.Frame(root)
     own_container.pack(side="top", fill="both", expand=True)
     text = tk.Text(
@@ -226,6 +260,154 @@ def run(engine: Any) -> None:
     )
     peers_view.tag_configure("tombstone_body", foreground="#999")
     peers_view.tag_configure("empty", foreground="#aaa", font=("Helvetica", 10, "italic"))
+    # Attachment-token style: dark green text on a pale-yellow background +
+    # bold + underline. Three independent signals on purpose - on a busy
+    # screen, a single thin green underline at 12pt is too easy to miss.
+    attachment_font = tkfont.Font(
+        family=body_font.cget("family"),
+        size=body_font.cget("size"),
+        weight="bold",
+    )
+    for w in (peers_view, text):
+        w.tag_configure(
+            "attachment",
+            foreground="#0a5",
+            background="#fff6c2",
+            underline=True,
+            font=attachment_font,
+        )
+
+    def _retag_attachments(widget: tk.Text, start: str, body: str) -> None:
+        """Apply the ``attachment`` tag to every token in ``body``.
+
+        ``start`` is a Tk index string identifying the start of ``body``
+        in ``widget``. Tokens are located via parse_attachment_tokens so
+        the regex stays in one place.
+
+        We resolve ``start`` to canonical ``"L.C"`` form via
+        ``widget.index`` BEFORE building any offset expressions. Tk's
+        index parser handles ``markname + Nc`` just fine in most places,
+        but for hostnames containing ``-`` (e.g. ``DESKTOP-NM6GRPH``)
+        the mark name itself contains a hyphen and the resulting
+        ``__peer_start_DESKTOP-NM6GRPH + 42c`` expression was producing
+        empty tag ranges in ``tag_add`` while ``index``/``insert``
+        accepted the same expression. Resolving up front avoids the
+        ambiguity entirely.
+        """
+        try:
+            base = widget.index(start)
+            widget.tag_remove("attachment", base, f"{base} + {len(body)}c")
+            count = 0
+            for _sha, _name, s, e in parse_attachment_tokens(body):
+                widget.tag_add(
+                    "attachment", f"{base} + {s}c", f"{base} + {e}c"
+                )
+                count += 1
+            if count:
+                # Quick telemetry so we can confirm from the log that the
+                # tag is being applied even when it visually isn't (e.g.
+                # if a future bug re-introduces priority/order issues).
+                log_info(
+                    "retagged " + str(count) + " token(s)",
+                    context="tk.retag_attachments",
+                )
+        except tk.TclError as ex:
+            log_exception(ex, context="tk.retag_attachments")
+
+    # ---------- right-click context menu: Save attachment as... ----------
+    def _token_at_click(widget: tk.Text, event: Any) -> tuple[str, str] | None:
+        """Return (sha, filename) for the token under the click, or None.
+
+        Looks at the entire current line; tokens never span a newline so a
+        line-wide scan is sufficient and avoids any need to track tag
+        ranges. The cursor's x-position is mapped to a char offset within
+        the line so we can pick the matching token.
+        """
+        try:
+            idx = widget.index(f"@{event.x},{event.y}")
+        except tk.TclError:
+            return None
+        line_start = widget.index(f"{idx} linestart")
+        line_end = widget.index(f"{idx} lineend")
+        line_text = widget.get(line_start, line_end)
+        col = int(idx.split(".")[1])
+        for sha, name, s, e in parse_attachment_tokens(line_text):
+            if s <= col < e:
+                return sha, name
+        return None
+
+    def _peer_hostname_at_click(event: Any) -> str | None:
+        """Walk the peer section start-marks to find which peer's section
+        contains the clicked line. Returns None outside any section."""
+        try:
+            idx = peers_view.index(f"@{event.x},{event.y}")
+        except tk.TclError:
+            return None
+        click_line = int(float(idx))
+        best: tuple[str, int] | None = None
+        for hostname, (start_mark, _) in peer_section_marks.items():
+            try:
+                start_line = int(float(peers_view.index(start_mark)))
+            except tk.TclError:
+                continue
+            if start_line <= click_line and (best is None or start_line > best[1]):
+                best = (hostname, start_line)
+        return best[0] if best else None
+
+    def _save_attachment_dialog(sha: str, filename: str, peer_hostname: str | None) -> None:
+        """Prompt the user for a destination, fetching the blob if needed."""
+        if not engine.attachment_store.has(sha):
+            if peer_hostname is None:
+                set_transient("attachment not cached and no source peer")
+                return
+            set_transient("fetching " + filename + "...")
+            ok = engine.ensure_attachment(peer_hostname, sha)
+            if not ok:
+                set_transient("fetch failed for " + filename)
+                return
+        dest = filedialog.asksaveasfilename(
+            parent=root, title="Save attachment as...", initialfile=filename
+        )
+        if not dest:
+            return
+        try:
+            engine.attachment_store.save_to(sha, Path(dest))
+        except OSError as e:
+            log_exception(e, context="tk.save_attachment")
+            set_transient("save failed: " + str(e))
+            return
+        set_transient("saved " + filename)
+
+    def _show_attachment_menu(widget: tk.Text, event: Any, peer_hostname: str | None) -> None:
+        hit = _token_at_click(widget, event)
+        if hit is None:
+            return
+        sha, filename = hit
+        menu = tk.Menu(root, tearoff=0)
+        menu.add_command(
+            label="Save attachment as...",
+            command=lambda: _save_attachment_dialog(sha, filename, peer_hostname),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # Right-click bindings. Button-3 is the canonical right-click on
+    # Windows and X11; Button-2 covers older macOS three-button mice.
+    # macOS two-button trackpads also fire Button-2, so binding both
+    # gives us cross-platform coverage without a per-OS branch.
+    for btn in ("<Button-3>", "<Button-2>"):
+        text.bind(
+            btn,
+            lambda e: _show_attachment_menu(text, e, peer_hostname=None),
+        )
+        peers_view.bind(
+            btn,
+            lambda e: _show_attachment_menu(
+                peers_view, e, peer_hostname=_peer_hostname_at_click(e)
+            ),
+        )
 
     # ---------- per-peer surgical-update state ----------
     # hostname -> (start_mark_name, content_len_in_chars). The start mark has
@@ -304,6 +486,7 @@ def run(engine: Any) -> None:
                 content_len = len(header_line) + len(body)
                 peer_section_marks[p.hostname] = (start_mark, content_len)
                 peer_fingerprints[p.hostname] = _peer_fingerprint(p)
+                _retag_attachments(peers_view, start_mark, header_line + body)
                 # Visual separator BETWEEN sections, OUTSIDE the section
                 # length we cached above. Without this, the next peer's
                 # start_mark would be placed at "end-1c" — which is also
@@ -397,6 +580,7 @@ def run(engine: Any) -> None:
             new_content_len = len(header_line) + len(body)
             peer_section_marks[p.hostname] = (start_mark, new_content_len)
             peer_fingerprints[p.hostname] = new_fp
+            _retag_attachments(peers_view, start_mark, header_line + body)
         peers_view.configure(state="disabled")
 
         if surgical_failed:
@@ -437,6 +621,7 @@ def run(engine: Any) -> None:
         new_text = text.get("1.0", "end-1c")
         engine.set_local_text(new_text)
         text.edit_modified(False)
+        _retag_attachments(text, "1.0", new_text)
         set_transient("editing…")
         schedule_save()
 

@@ -2,7 +2,6 @@
 
 ## Up next
 
-- [ ] **engine/attachments.py** - content-addressed blob store at `~/.netnotepad/attachments/<sha>`, tiny HTTP server on the attachment port, fetch-by-sha client, `AttachmentOffer` broadcasts on the keystroke channel. Tk integration: paste/drop a file or image to attach it; reference tokens in text expand to inline images via `text.image_create(...)`.
 - [ ] **Terminal renderer using `prompt_toolkit`** - same engine API, multi-pane layout with our block editable and peer blocks read-only. Uses the engine's insert/delete/move_cursor methods rather than `set_local_text`, exercising the Delta path that Tk doesn't.
 
 ## Later
@@ -17,6 +16,7 @@
 
 ## Verified
 
+- [x] **2026-05-19** - Attachments end-to-end. `engine/attachments.py` is the real module now: `AttachmentStore` (content-addressed cache at `~/.netnotepad/attachments/<sha>`, atomic temp+rename writes), `AttachmentServer` (`ThreadingHTTPServer` with `GET /blob/<sha>`, mirrors Mesh's port-fallback pattern), `fetch_blob` (urllib client that verifies sha on receipt). Engine wiring: server boots in `start_networking` before discovery so the TXT record carries the actually-bound port; `_on_remote_message` captures attach_port from Hello and records `AttachmentOffer` on `Peer.known_attachments`, kicking a background prefetch; public `attach_bytes`/`attach_file` hash + cache + broadcast offer; public `ensure_attachment(peer, sha)` is the sync retry path. Tk minimal v1: "Attach file..." button, green-underlined token tag in both panes, right-click "Save attachment as..." that fetches on demand for peer tokens. `MAX_ATTACHMENT_BYTES = 50 MB`. Image-rendering of inline tokens stays Later. 25 new tests in `tests/test_attachments.py` (token helpers, store, server, fetch client, engine integration). Full suite: 75/75 green.
 - [x] **2026-05-13** - Document model unit tests pass (16/16).
 - [x] **2026-05-13** - Discovery end-to-end smoke test passes - two Discovery instances find each other via mDNS.
 - [x] **2026-05-13** - Network end-to-end tests pass (3/3) - two engines mutually discover, bidirectional sync works, late-joining peer receives initial snapshot.
