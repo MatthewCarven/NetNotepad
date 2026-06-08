@@ -460,3 +460,23 @@ New `tests/test_attachments.py`:
 ### Process note
 
 Hit the mount-drift footgun again (it's in memory). Two distinct symptoms this round: (1) the very first `Write` call for `attachments.py` only landed ~10 lines on the bash side, so Python read a truncated file; (2) one of the bigger engine Edits silently failed to land while smaller ones in the same file landed fine - the file's tail got chopped mid-method. Recovery was the documented workaround: rebuild the file via `cat << 'EOF' >` heredoc and verify with `wc -l`. Worth knowing: stale `.pyc` cache files on the Windows side are read-only from the Linux mount, so `find -delete` fails. `PYTHONPYCACHEPREFIX=/tmp/nnpy python -B` works around it cleanly without needing to delete anything.
+
+## 2026-06-08 - terminal renderer: design note (plan only)
+
+Picked the "Up next" item — the `prompt_toolkit` terminal renderer — but scoped this session to a **plan only** (Matthew's call). No renderer code landed; the `term` branch in `__main__.py` is still the stub.
+
+Grounded the plan against the actually-installed prompt_toolkit (**3.0.52**) rather than guessing the API: confirmed `create_pipe_input()` is a context manager (clean headless-test path), and that `FormattedTextControl(get_cursor_position=...)` + `Point` exist — so the own-block cursor can be driven straight from `engine.document.cursor` without a Buffer/TextArea.
+
+Wrote `terminal_renderer_PLAN.md` at the project root. Key decisions captured:
+
+- **Why it exists**: it's the renderer that drives editing through `engine.insert/delete_*/move_cursor` (the Delta path), which the Tk renderer never touches (Tk mirrors via `set_local_text` → Snapshot). Closes the loop on the Delta wire path the engine already supports and tests.
+- **Editing model**: own block is a `FormattedTextControl` reading `engine.document.text` with `get_cursor_position` from the engine cursor; a `KeyBindings` set maps keys to engine calls + `app.invalidate()`. No prompt_toolkit Buffer (that would re-introduce the mirror posture that defeats the purpose).
+- **Threading**: networking on a daemon thread (start_networking blocks ~1.5s); peer callbacks just call `app.invalidate()` (thread-safe); both panes read engine state at render time, so no cross-thread marshalling.
+- **Tests**: headless via `create_pipe_input()` + `DummyOutput`; the headline test feeds scripted keys and asserts both the final text and the emitted `Delta` sequence (recorded off `on_local_change`) — verifying the Delta path end-to-end with no terminal.
+- **Deferred for v1**: attachment attach/save-as UI (tokens still render styled), remembered vertical column on Up/Down, wide-char cell-vs-grapheme cursor offset, peers-pane paging.
+
+Estimated one focused session to build: `term_renderer.py` ~250–350 lines + ~200 lines of tests. Suite still **75/75** (no code touched this session).
+
+### Files touched
+- `terminal_renderer_PLAN.md` — new design note.
+- `TODO.md` — "Up next" now points at the plan.

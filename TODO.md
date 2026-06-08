@@ -3,6 +3,7 @@
 ## Up next
 
 - [ ] **Terminal renderer using `prompt_toolkit`** - same engine API, multi-pane layout with our block editable and peer blocks read-only. Uses the engine's insert/delete/move_cursor methods rather than `set_local_text`, exercising the Delta path that Tk doesn't.
+  - Design note written 2026-06-08: see `terminal_renderer_PLAN.md` — build from it next session. prompt_toolkit 3.0.52 confirmed; own block is a `FormattedTextControl` + `get_cursor_position` driven by the engine cursor; headless test path via `create_pipe_input()` + `DummyOutput`. Attachment attach/save-as UI deferred to a follow-up within the renderer.
 
 ## Later
 
