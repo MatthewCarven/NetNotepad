@@ -12,7 +12,7 @@ cd /d %~dp0
 
 echo [1/4] Ensuring build deps are installed...
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet pyinstaller regex zeroconf
+python -m pip install --quiet pyinstaller regex zeroconf prompt_toolkit
 if errorlevel 1 (
     echo Failed to install build dependencies.
     pause
@@ -38,6 +38,7 @@ python -m PyInstaller ^
     --name netnotepad ^
     --noconfirm ^
     --collect-all zeroconf ^
+    --collect-all prompt_toolkit ^
     run.py
 if errorlevel 1 (
     echo PyInstaller failed.

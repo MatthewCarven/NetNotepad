@@ -480,3 +480,45 @@ Estimated one focused session to build: `term_renderer.py` ~250–350 lines + ~2
 ### Files touched
 - `terminal_renderer_PLAN.md` — new design note.
 - `TODO.md` — "Up next" now points at the plan.
+
+## 2026-06-08 (later) - terminal renderer built
+
+Built the `prompt_toolkit` terminal renderer from this morning's plan (`terminal_renderer_PLAN.md`) after Matthew cleared the stale `.git` locks and gave the go. It is the renderer that drives editing through the engine's Delta path — `engine.insert` / `delete_backward` / `delete_forward` / `move_cursor` — so every keystroke emits an incremental `Delta` on the mesh. The Tk renderer only ever emits Snapshots (it lets the Tk Text widget own editing and mirrors the result via `set_local_text`), so until now no human-driven renderer exercised the Delta wire path. This closes that loop.
+
+### What got built
+
+- **`netnotepad/renderer/term_renderer.py`** (~460 lines). Public surface mirrors Tk: `run(engine)`. Also exposes `build_application(engine, *, input, output, full_screen)` so tests can construct the app with a pipe input + `DummyOutput` and drive it headlessly without starting networking.
+  - **The engine stays the source of truth.** The own block is deliberately NOT a prompt_toolkit `Buffer`/`TextArea` (those own their own editing model — the Tk "mirror the widget" posture we are trying to avoid). It is a `FormattedTextControl` whose text callable returns `engine.document.text` (attachment tokens highlighted) and whose `get_cursor_position` returns `Point(x=col, y=line)` from `engine.document.cursor`. A `KeyBindings` set translates each key into an engine call.
+  - **Keymap**: printable chars -> `engine.insert`; Enter -> newline; Tab -> 4 spaces; Backspace/Delete -> `delete_backward`/`delete_forward`; arrows/Home/End -> `engine.move_cursor` (target computed by grapheme-aware pure helpers `_move_left/right/up/down/home/end`); Ctrl-S save; Ctrl-Q/Ctrl-C quit.
+  - **Layout** (full-screen HSplit): status bar (hostname, peer count, transient) / own header / editable own block / separator / peers header / read-only peers pane. The peers pane reuses the exact body-state logic from Tk (text / (empty) / (no content received yet) keyed on `has_received_snapshot`; dimmed when tombstoned).
+  - **Threading**: `engine.start_networking()` (blocks ~1.5s) runs on a daemon thread; peer callbacks (`on_peer_changed`/`on_peer_tombstoned`, fired on mesh/zeroconf threads) only call `app.invalidate()` — the panes pull fresh engine state at render time, so nothing crosses the thread boundary. Saves run on the event-loop (main) thread via `call_later`, so they never race the document mutation that happens in key handlers on the same thread (the engine's Document is explicitly not thread-safe).
+  - **Save**: Ctrl-S immediate + 2s idle autosave (loop `call_later`) + save on exit. Attachment tokens render highlighted in both panes; the attach/save-as UI is deferred (TODO).
+- **`netnotepad/__main__.py`**: the `--renderer term` branch (was a "not implemented yet" stub) now imports and runs the terminal renderer.
+- **Dependency**: `prompt_toolkit>=3.0` added to `pyproject.toml`; `build_exe.bat` installs it and passes `--collect-all prompt_toolkit` (prompt_toolkit imports submodules dynamically, like zeroconf).
+
+### Tests (18 new)
+
+`tests/test_term_renderer.py`, all headless (the sandbox has no TTY): driven via `create_pipe_input()` + `DummyOutput()`, feeding a scripted byte sequence ending in Ctrl-Q and asserting on engine state afterwards.
+
+- Pure helpers: grapheme line lengths; cursor-move targets (within line, wrap up/down, vertical clamp, home/end); status text with and without peers; peer-section body states; attachment-token fragment styling (and that the fragment texts concatenate back to the source exactly, which keeps the cursor column arithmetic valid).
+- Key->Delta integration: typing emits one `Delta` per char; Enter inserts a newline; Tab inserts spaces; Backspace emits a remove-`Delta`; Left-arrow then insert lands the char at the moved cursor; Home then forward-Delete; Ctrl-S writes `mine.txt`; building the app registers the peer callbacks.
+
+### Verified
+
+- `tests/test_term_renderer.py`: 18/18 green (0.42s).
+- Full local-testable suite: 80 green — 16 document, 13 logging, 25 attachments, 8 network-unit (delta application / on_remote_message), 18 term.
+- The 13 real-zeroconf tests (6 network end-to-end + 7 discovery) hang in this Cowork Linux sandbox — it lacks reliable mDNS/multicast — so they are left for live verification on Matthew's LAN, consistent with how this project has always verified live behaviour. They exercise engine code this change does not touch.
+- `py_compile` clean on `term_renderer.py` + `__main__.py`; full-module import smoke clean.
+
+### Process notes
+
+- The mount-drift footgun struck `__main__.py`: the `Edit` reported success but bash saw the file as null-byte-corrupt (`py_compile`: "source code string cannot contain null bytes"). Rebuilt it via the documented `cat << 'EOF'` heredoc; clean afterwards. `term_renderer.py` (written once via the file tool) and the test file (authored via heredoc) were both fine. Doc edits (pyproject/build_exe/TODO/WORKLOG) were done in-place via Python in bash to avoid the same risk.
+- This fresh sandbox had none of `zeroconf` / `regex` / `pytest` / `prompt_toolkit` installed — `pip install ... --break-system-packages` for all four. Noted because the test suite can't import the engine without zeroconf/regex.
+
+### Files touched
+- `netnotepad/renderer/term_renderer.py` — new (~460 lines).
+- `netnotepad/__main__.py` — `--renderer term` now runs the renderer.
+- `tests/test_term_renderer.py` — new, 18 tests.
+- `pyproject.toml` — `prompt_toolkit>=3.0` dependency.
+- `build_exe.bat` — install prompt_toolkit + `--collect-all prompt_toolkit`.
+- `TODO.md` — terminal renderer moved to Verified; v1 follow-ups now the Up-next item.

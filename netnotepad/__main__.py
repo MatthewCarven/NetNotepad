@@ -42,8 +42,9 @@ def main() -> int:
 
             run_tk(engine)
         else:
-            print("term renderer not implemented yet — see TODO.md", file=sys.stderr)
-            return 1
+            from netnotepad.renderer.term_renderer import run as run_term
+
+            run_term(engine)
     except KeyboardInterrupt:
         log_info("netnotepad shutting down (keyboard interrupt)", context="main")
     finally:
