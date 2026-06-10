@@ -66,7 +66,7 @@ netnotepad/
     tk_renderer.py       Tkinter UI
     term_renderer.py     prompt_toolkit terminal UI (--renderer term)
 
-tests/                   pytest suite, 100 tests
+tests/                   pytest suite, 109 tests
 DESIGN.md                why things are the way they are
 WORKLOG.md               what happened, day by day
 TODO.md                  what's next, what's later, what's verified

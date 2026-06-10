@@ -561,3 +561,37 @@ Previous session's commit landed (`7888ba9`, pushed along with `cabe8f4`) after 
 - `README.md` — deps, renderer/layout/features/test-count refresh.
 - `start.bat` — `%~dp0` fix + pip install line.
 - `TODO.md` / `WORKLOG.md` — this entry; Up-next narrowed to attach/save-as UI + wrapping.
+
+## 2026-06-10 (later) — Terminal renderer attach/save-as UI
+
+Second slice of the day: the last big term-renderer follow-up. The morning's commits (`ac35cb7` + `341ed64`, Claude.md now tracked) were made and pushed by Matthew from Windows — the sandbox's `.git` view still shows a phantom `index.lock`, so git keeps being his side of the working agreement.
+
+### Dialog bar
+
+- One new layout row: a single-line dialog bar at the bottom of the HSplit inside a `ConditionalContainer` that only shows while `ui["dialog"]` is set. Its text is plain state in the `ui` dict rendered by a `FormattedTextControl` — deliberately NOT a prompt_toolkit `Buffer`/`TextArea`, same reasoning as the own block: one editing model, owned by us.
+- Mode switching is done with `Condition` filters on the key bindings themselves: every document-mode binding got `filter=~dialog_active`, and a parallel set (printable append, backspace, Enter=accept, Escape/Ctrl-G=cancel) is active while a dialog is open. Ctrl-Q/Ctrl-C remain global so quit works mid-prompt. Enter closes the dialog *before* calling the accept callback, because accept may open the next prompt (the save flow chains pick -> destination).
+
+### Ctrl-A — attach
+
+- Prompts "attach file: ", expands `~`, calls `engine.attach_file`, inserts the returned token with `engine.insert` — i.e. the token rides the same Delta wire path as typed text, and the AttachmentOffer broadcast happens inside `attach_bytes` as designed. Distinct transients for missing file / directory / permission / over-50MB / other OSError.
+
+### Ctrl-D — save attachment
+
+- Target resolution, in order: token under the cursor (`_token_at_cursor` — converts the grapheme cursor column to a string index before span-matching, so tokens after emoji resolve correctly; matches `s <= idx <= e` so "just after the token" counts); otherwise `_visible_attachments` (every token in our block then each peer's block, sha-deduped, owner recorded — that's who `ensure_attachment` fetches from); one match goes straight to the destination prompt, several get a numbered pick.
+- Destination prompt: `_resolve_dest` — an existing directory keeps the attachment's original filename.
+- Blob already cached (own attachments, prefetched peer blobs): synchronous `attachment_store.save_to`, instant transient. Uncached: "fetching …" transient and a daemon thread doing `ensure_attachment` + `save_to`, reporting back via transient only — no engine/document state touched off-thread.
+
+### Verified
+
+- 9 new tests: `_token_at_cursor` (hits, misses, just-after, emoji-prefixed line), `_visible_attachments` dedup/order, `_resolve_dest` dir-vs-file, attach end-to-end (token in document + blob in store + Delta emitted + path chars never reached the document), attach with missing file reports-not-inserts, Ctrl-G cancel, save-own-token-under-cursor, save-peer-blob via the numbered pick (store pre-seeded, sync path), Ctrl-D with no tokens is a no-op.
+- `tests/test_term_renderer.py`: 34/34 green. Full local suite: 96 green (16 document, 13 logging, 25 attachments, 8 network-unit, 34 term). 13 real-mDNS tests stay for live LAN verification.
+
+### Process notes
+
+- `term_renderer.py` was rewritten wholesale via the `cat << 'EOF'` heredoc from the start this time (752 lines) rather than risking another mid-edit truncation like the morning's; compile + suite clean on first run.
+
+### Files touched
+- `netnotepad/renderer/term_renderer.py` — dialog bar, Ctrl-A/Ctrl-D, helpers (`_token_at_cursor`, `_visible_attachments`, `_resolve_dest`), docstring.
+- `tests/test_term_renderer.py` — 9 new tests (34 total).
+- `README.md` — test count.
+- `TODO.md` / `WORKLOG.md` — this entry; Up next is now only the own-block line-wrapping consideration.

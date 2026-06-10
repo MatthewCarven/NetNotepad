@@ -17,19 +17,25 @@ Layout (top to bottom, a full-screen ``HSplit``):
     separator
     peers header
     peers pane     (read-only; one section per peer, dimmed if tombstoned)
+    dialog bar     (single line, only while a prompt is open)
 
 The own block deliberately is NOT a prompt_toolkit ``Buffer`` / ``TextArea`` —
 those own their own editing model, which would put us back in the Tk-style
 "mirror the widget" posture that defeats the purpose. Instead the engine's
 ``Document`` is the single source of truth: a ``KeyBindings`` set translates each
 key into an engine call and the control re-reads engine state on every render.
+The dialog bar follows the same philosophy — its text lives in the shared ``ui``
+dict, and ``Condition`` filters swap the key bindings between document mode and
+dialog mode.
 
 Threading: prompt_toolkit's event loop runs on the main thread, so key handlers
 (and therefore all document edits and saves) are serialized there.
 ``engine.start_networking`` blocks ~1.5s and runs on a daemon thread. Peer
 callbacks fire on zeroconf/mesh background threads and only call
 ``app.invalidate()`` (thread-safe) — the panes pull fresh engine state at render
-time, so nothing is marshalled across the thread boundary.
+time, so nothing is marshalled across the thread boundary. Fetching a peer's
+attachment blob (Ctrl-D on an uncached sha) also runs on a daemon thread and
+reports back via the transient status only.
 
 Vertical movement remembers a goal (virtual) column: Up/Down through a short
 line clamps the cursor but pops it back out on a long-enough line; any
@@ -39,11 +45,19 @@ at the scroll line because prompt_toolkit clamps a window's ``vertical_scroll``
 to keep the content cursor visible — without it the pane snaps back to the top
 on the next render.
 
+Attachments: **Ctrl-A** prompts for a path and attaches the file (the returned
+token is inserted at the cursor through the Delta path, so it propagates like
+any other edit). **Ctrl-D** saves an attachment: the token under the cursor if
+there is one, otherwise a numbered pick from every token visible in our block
+and the peers' blocks; a second prompt takes the destination (a directory keeps
+the original filename). Locally-cached blobs save synchronously; a peer's
+uncached blob is fetched on a background thread via ``engine.ensure_attachment``.
+Enter on an empty prompt, Escape, or Ctrl-G cancels.
+
 Known v1 limitations (see terminal_renderer_PLAN.md): the own block does not wrap
 (long lines scroll horizontally) so the grapheme cursor maps cleanly to a screen
 row; on lines containing wide/zero-width characters the cursor column (graphemes)
-can sit a cell off the rendered glyph. Attachment tokens render highlighted in
-both panes, but the attach / save-as UI is a follow-up.
+can sit a cell off the rendered glyph.
 """
 
 from __future__ import annotations
@@ -51,13 +65,15 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.data_structures import Point
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 
@@ -143,6 +159,54 @@ def _page_scroll(current: int, page: int, content: int, pages: int) -> int:
     if page <= 0 or content <= page:
         return 0
     return max(0, min(content - page, current + pages * page))
+
+
+def _token_at_cursor(text: str, line: int, col: int) -> tuple[str, str] | None:
+    """Return ``(sha, filename)`` for the attachment token under the cursor,
+    or None. ``col`` is a grapheme column (the document's cursor unit); it is
+    converted to a string index before comparing against token spans, so a
+    token after an emoji on the same line is still found. The cursor counts as
+    "on" a token from its first character through the position just after it
+    (``s <= idx <= e``) — one keystroke after typing/attaching, Ctrl-D works.
+    Tokens never span a newline, so a single-line scan is sufficient."""
+    lines = text.split("\n")
+    if not (0 <= line < len(lines)):
+        return None
+    g = _graphemes(lines[line])
+    idx = sum(len(x) for x in g[:col])
+    for sha, name, s, e in parse_attachment_tokens(lines[line]):
+        if s <= idx <= e:
+            return sha, name
+    return None
+
+
+def _visible_attachments(engine: Any) -> list[tuple[str, str, str | None]]:
+    """Every attachment token currently on screen, de-duplicated by sha:
+    ``(sha, filename, owner_hostname)`` — owner None for tokens in our own
+    block, the peer's hostname for tokens in a peer's block (that's who
+    ``ensure_attachment`` will fetch from). Ours first, then peers in
+    ``sorted_peers()`` order."""
+    out: list[tuple[str, str, str | None]] = []
+    seen: set[str] = set()
+    for sha, name, _s, _e in parse_attachment_tokens(engine.document.text):
+        if sha not in seen:
+            out.append((sha, name, None))
+            seen.add(sha)
+    for p in engine.sorted_peers():
+        for sha, name, _s, _e in parse_attachment_tokens(p.block_text or ""):
+            if sha not in seen:
+                out.append((sha, name, p.hostname))
+                seen.add(sha)
+    return out
+
+
+def _resolve_dest(dest: str, filename: str) -> Path:
+    """Destination path for a save: ``~`` expanded; an existing directory
+    keeps the attachment's original filename."""
+    p = Path(dest).expanduser()
+    if p.is_dir():
+        return p / filename
+    return p
 
 
 def _format_time(ts: float) -> str:
@@ -245,6 +309,7 @@ _STYLE = Style.from_dict(
         "peer-body-off": "#6c6c6c",
         "attachment": "#00af5f bold underline",
         "empty": "#8a8a8a italic",
+        "dialog": "bg:#875f00 #ffffff bold",
     }
 )
 
@@ -271,6 +336,7 @@ def _build(
         "autosave": None,
         "goal_col": None,    # remembered column for an Up/Down run; None = unset
         "peers_scroll": 0,   # top content line of the peers pane
+        "dialog": None,      # {"prompt": str, "text": str, "accept": fn} | None
     }
 
     def invalidate() -> None:
@@ -328,7 +394,12 @@ def _build(
         return [("class:own-header", "  " + engine.hostname + "  (you)")]
 
     def peers_header_text() -> list[tuple[str, str]]:
-        return [("class:peers-header", "  peers")]
+        return [
+            (
+                "class:peers-header",
+                "  peers   ·   ^A attach  ^D save-attachment  PgUp/PgDn scroll",
+            )
+        ]
 
     def peers_text() -> list[tuple[str, str]]:
         return _peers_fragments(engine)
@@ -342,6 +413,23 @@ def _build(
         ui["peers_scroll"] = max(0, min(ui["peers_scroll"], last))
         return Point(x=0, y=ui["peers_scroll"])
 
+    # ---- dialog bar (attach / save-as prompts) ----
+    dialog_active = Condition(lambda: ui["dialog"] is not None)
+
+    def open_dialog(prompt: str, accept: Callable[[str], None]) -> None:
+        ui["dialog"] = {"prompt": prompt, "text": "", "accept": accept}
+        invalidate()
+
+    def close_dialog() -> None:
+        ui["dialog"] = None
+        invalidate()
+
+    def dialog_fragments() -> list[tuple[str, str]]:
+        d = ui["dialog"]
+        if d is None:
+            return []
+        return [("class:dialog", " " + d["prompt"] + d["text"])]
+
     own_window = Window(
         FormattedTextControl(text=own_text, focusable=True, get_cursor_position=own_cursor),
         wrap_lines=False,
@@ -349,6 +437,10 @@ def _build(
     peers_window = Window(
         FormattedTextControl(text=peers_text, focusable=True, get_cursor_position=peers_cursor),
         wrap_lines=True,
+    )
+    dialog_bar = ConditionalContainer(
+        Window(FormattedTextControl(text=dialog_fragments), height=1, style="class:dialog"),
+        filter=dialog_active,
     )
 
     root = HSplit(
@@ -359,35 +451,138 @@ def _build(
             Window(height=1, char="─", style="class:sep"),
             Window(FormattedTextControl(text=peers_header_text), height=1, style="class:peers-header"),
             peers_window,
+            dialog_bar,
         ]
     )
 
+    # ---- attachment actions ----
+    def _do_attach(path_str: str) -> None:
+        path_str = path_str.strip()
+        if not path_str:
+            set_transient("attach cancelled")
+            return
+        p = Path(path_str).expanduser()
+        try:
+            _sha, token = engine.attach_file(p)
+        except FileNotFoundError:
+            set_transient("attach failed: no such file")
+            return
+        except IsADirectoryError:
+            set_transient("attach failed: that's a directory")
+            return
+        except PermissionError:
+            set_transient("attach failed: permission denied")
+            return
+        except ValueError as e:  # exceeds MAX_ATTACHMENT_BYTES
+            log_exception(e, context="term.attach")
+            set_transient("attach failed: file too large")
+            return
+        except OSError as e:
+            log_exception(e, context="term.attach")
+            set_transient("attach failed")
+            return
+        engine.insert(token)  # Delta path — propagates like any edit
+        mark_dirty()
+        set_transient("attached " + p.name)
+
+    def _do_save_attachment(sha: str, filename: str, owner: str | None, dest_str: str) -> None:
+        dest_str = dest_str.strip()
+        if not dest_str:
+            set_transient("save cancelled")
+            return
+        dest = _resolve_dest(dest_str, filename)
+
+        def write_out() -> bool:
+            try:
+                engine.attachment_store.save_to(sha, dest)
+                return True
+            except OSError as e:
+                log_exception(e, context="term.save_attachment")
+                return False
+
+        if engine.attachment_store.has(sha):
+            # Cached (our own attachment, or an already-prefetched peer blob):
+            # save synchronously — deterministic and instant.
+            set_transient(("saved " + filename) if write_out() else "save failed")
+            return
+
+        def _bg() -> None:
+            ok = False
+            try:
+                ok = owner is not None and engine.ensure_attachment(owner, sha)
+            except Exception as e:
+                log_exception(e, context="term.ensure_attachment")
+            set_transient(("saved " + filename) if (ok and write_out()) else "save failed")
+
+        set_transient("fetching " + filename + "…")
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _prompt_dest(sha: str, filename: str, owner: str | None) -> None:
+        open_dialog(
+            "save " + filename + " to: ",
+            lambda s: _do_save_attachment(sha, filename, owner, s),
+        )
+
+    def _start_save_attachment() -> None:
+        doc = engine.document
+        hit = _token_at_cursor(doc.text, doc.cursor.line, doc.cursor.col)
+        if hit is not None:
+            _prompt_dest(hit[0], hit[1], None)
+            return
+        atts = _visible_attachments(engine)
+        if not atts:
+            set_transient("no attachments")
+            return
+        if len(atts) == 1:
+            sha, name, owner = atts[0]
+            _prompt_dest(sha, name, owner)
+            return
+        listing = "  ".join(
+            str(i + 1) + ":" + name + ("" if owner is None else "(" + owner + ")")
+            for i, (_sha, name, owner) in enumerate(atts)
+        )
+
+        def pick(s: str) -> None:
+            s = s.strip()
+            if not s:
+                set_transient("save cancelled")
+                return
+            try:
+                sha, name, owner = atts[int(s) - 1]
+            except (ValueError, IndexError):
+                set_transient("no such attachment")
+                return
+            _prompt_dest(sha, name, owner)
+
+        open_dialog("save which?  " + listing + "  > ", pick)
+
     # ---- key bindings: every edit goes through the engine (Delta path) ----
     kb = KeyBindings()
+    in_doc = ~dialog_active  # document-mode bindings are off while a prompt is open
 
-    @kb.add(Keys.Any)
+    @kb.add(Keys.Any, filter=in_doc)
     def _(event: Any) -> None:
         data = event.data
         if data and data.isprintable():
             engine.insert(data)
             mark_dirty()
 
-    @kb.add("enter")
+    @kb.add("enter", filter=in_doc)
     def _(event: Any) -> None:
         engine.insert("\n")
         mark_dirty()
 
-    @kb.add("tab")
+    @kb.add("tab", filter=in_doc)
     def _(event: Any) -> None:
         engine.insert(TAB_INSERT)
         mark_dirty()
 
-    @kb.add("backspace")
+    @kb.add("backspace", filter=in_doc)
     def _(event: Any) -> None:
         engine.delete_backward()
         mark_dirty()
 
-    @kb.add("delete")
+    @kb.add("delete", filter=in_doc)
     def _(event: Any) -> None:
         engine.delete_forward()
         mark_dirty()
@@ -397,7 +592,7 @@ def _build(
         fn: Callable[..., tuple[int, int]],
         vertical: bool = False,
     ) -> None:
-        @kb.add(key)
+        @kb.add(key, filter=in_doc)
         def _(event: Any) -> None:
             doc = engine.document
             if vertical:
@@ -420,7 +615,7 @@ def _build(
     _bind_move("end", _move_end)
 
     def _bind_page(key: str, pages: int) -> None:
-        @kb.add(key)
+        @kb.add(key, filter=in_doc)
         def _(event: Any) -> None:
             info = peers_window.render_info
             if info is not None:
@@ -437,10 +632,46 @@ def _build(
     _bind_page("pageup", -1)
     _bind_page("pagedown", 1)
 
-    @kb.add("c-s")
+    @kb.add("c-s", filter=in_doc)
     def _(event: Any) -> None:
         do_save()
 
+    @kb.add("c-a", filter=in_doc)
+    def _(event: Any) -> None:
+        open_dialog("attach file: ", _do_attach)
+
+    @kb.add("c-d", filter=in_doc)
+    def _(event: Any) -> None:
+        _start_save_attachment()
+
+    # ---- dialog-mode bindings ----
+    @kb.add(Keys.Any, filter=dialog_active)
+    def _(event: Any) -> None:
+        data = event.data
+        if data and data.isprintable():
+            ui["dialog"]["text"] += data
+            invalidate()
+
+    @kb.add("backspace", filter=dialog_active)
+    def _(event: Any) -> None:
+        d = ui["dialog"]
+        d["text"] = d["text"][:-1]
+        invalidate()
+
+    @kb.add("enter", filter=dialog_active)
+    def _(event: Any) -> None:
+        d = ui["dialog"]
+        ui["dialog"] = None  # close before accept — accept may open the next prompt
+        d["accept"](d["text"])
+        invalidate()
+
+    @kb.add("escape", filter=dialog_active)
+    @kb.add("c-g", filter=dialog_active)
+    def _(event: Any) -> None:
+        close_dialog()
+        set_transient("cancelled")
+
+    # Quit stays global: it must work mid-dialog too.
     @kb.add("c-q")
     def _(event: Any) -> None:
         event.app.exit()

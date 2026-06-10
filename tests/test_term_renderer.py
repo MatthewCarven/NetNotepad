@@ -27,6 +27,9 @@ LEFT = "\x1b[D"
 UP = "\x1b[A"
 DOWN = "\x1b[B"
 PGUP = "\x1b[5~"
+CATTACH = "\x01"   # Ctrl-A
+CSAVEATT = "\x04"  # Ctrl-D
+CCANCEL = "\x07"   # Ctrl-G
 PGDN = "\x1b[6~"
 HOME = "\x1b[H"
 DEL = "\x1b[3~"   # forward delete
@@ -256,3 +259,108 @@ def test_pageup_scrolls_peers_pane_back_to_top(tmp_path):
         app.run()
         w = app._netnotepad_peers_window
     assert w.vertical_scroll == 0
+
+
+# ===================== attach / save-as dialogs =====================
+
+def test_token_at_cursor_hits_and_misses():
+    sha = "b" * 64
+    token = make_attachment_token(sha, "pic.png")
+    text = "see " + token + " ok"
+    s = 4
+    e = s + len(token)
+    assert tr._token_at_cursor(text, 0, s) == (sha, "pic.png")
+    assert tr._token_at_cursor(text, 0, e) == (sha, "pic.png")   # just after
+    assert tr._token_at_cursor(text, 0, 0) is None
+    assert tr._token_at_cursor(text, 0, e + 2) is None
+    assert tr._token_at_cursor(text, 5, 0) is None               # no such line
+    # grapheme column != string index: emoji before the token still resolves
+    fam = "\U0001F468\u200D\U0001F469\u200D\U0001F467\u200D\U0001F466"
+    text2 = fam + " " + token
+    assert tr._token_at_cursor(text2, 0, 2) == (sha, "pic.png")  # col 2 = token start
+
+
+def test_visible_attachments_dedup_and_order(tmp_path):
+    e = _engine(tmp_path)
+    sha_own, sha_peer = "c" * 64, "d" * 64
+    tok_own = make_attachment_token(sha_own, "mine.txt")
+    tok_peer = make_attachment_token(sha_peer, "theirs.txt")
+    e.document.set_text("x " + tok_own)
+    e.peers["p1"] = Peer(
+        hostname="p1",
+        block_text=tok_peer + " and again " + tok_peer + " and " + tok_own,
+        has_received_snapshot=True,
+    )
+    atts = tr._visible_attachments(e)
+    assert atts == [(sha_own, "mine.txt", None), (sha_peer, "theirs.txt", "p1")]
+
+
+def test_resolve_dest_directory_keeps_filename(tmp_path):
+    d = tmp_path / "outdir"
+    d.mkdir()
+    assert tr._resolve_dest(str(d), "pic.png") == d / "pic.png"
+    f = tmp_path / "explicit.bin"
+    assert tr._resolve_dest(str(f), "pic.png") == f
+
+
+def test_attach_dialog_inserts_token_and_stores_blob(tmp_path):
+    payload = tmp_path / "note.txt"
+    payload.write_bytes(b"hello attachment")
+    e = _engine(tmp_path)
+    msgs = _record(e)
+    _drive(e, "x " + CATTACH + str(payload) + ENTER + CQUIT)
+    text = e.document.text
+    tokens = list(tr.parse_attachment_tokens(text))
+    assert len(tokens) == 1
+    sha, name, _s, _e = tokens[0]
+    assert name == "note.txt"
+    assert e.attachment_store.has(sha)
+    assert text.startswith("x ")
+    # the token went out as a Delta (wire path), not just into the document
+    assert any(isinstance(m, Delta) and name in m.insert for m in msgs)
+    # the path characters typed into the dialog never reached the document
+    assert str(payload) not in text
+
+
+def test_attach_dialog_missing_file_reports_not_inserts(tmp_path):
+    e = _engine(tmp_path)
+    _drive(e, CATTACH + str(tmp_path / "nope.bin") + ENTER + "ok" + CQUIT)
+    assert e.document.text == "ok"
+    assert list(tr.parse_attachment_tokens(e.document.text)) == []
+
+
+def test_attach_dialog_cancel_via_ctrl_g(tmp_path):
+    e = _engine(tmp_path)
+    _drive(e, CATTACH + "garbage" + CCANCEL + "ok" + CQUIT)
+    assert e.document.text == "ok"
+
+
+def test_save_attachment_under_cursor_writes_file(tmp_path):
+    e = _engine(tmp_path)
+    sha, token = e.attach_bytes(b"own blob bytes", "own.bin")
+    e.insert(token)  # cursor ends just after the token -> still "under"
+    dest = tmp_path / "saved_own.bin"
+    _drive(e, CSAVEATT + str(dest) + ENTER + CQUIT)
+    assert dest.read_bytes() == b"own blob bytes"
+
+
+def test_save_peer_attachment_via_pick_list(tmp_path):
+    e = _engine(tmp_path)
+    # our own attachment, on line 0
+    _own_sha, own_token = e.attach_bytes(b"own", "own.bin")
+    e.insert(own_token)
+    e.insert("\n")  # cursor now on line 1 -> not on any token
+    # a peer attachment whose blob is already prefetched into our store
+    peer_sha = e.attachment_store.put_bytes(b"peer blob bytes")
+    peer_token = make_attachment_token(peer_sha, "peer.bin")
+    e.peers["p1"] = Peer(hostname="p1", block_text=peer_token, has_received_snapshot=True)
+    dest = tmp_path / "saved_peer.bin"
+    # two attachments visible -> numbered pick; "2" is the peer's
+    _drive(e, CSAVEATT + "2" + ENTER + str(dest) + ENTER + CQUIT)
+    assert dest.read_bytes() == b"peer blob bytes"
+
+
+def test_save_attachment_no_tokens_is_noop(tmp_path):
+    e = _engine(tmp_path)
+    _drive(e, "hi" + CSAVEATT + "ok" + CQUIT)
+    assert e.document.text == "hiok"
