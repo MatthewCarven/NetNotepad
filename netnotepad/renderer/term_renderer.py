@@ -31,12 +31,19 @@ callbacks fire on zeroconf/mesh background threads and only call
 ``app.invalidate()`` (thread-safe) — the panes pull fresh engine state at render
 time, so nothing is marshalled across the thread boundary.
 
+Vertical movement remembers a goal (virtual) column: Up/Down through a short
+line clamps the cursor but pops it back out on a long-enough line; any
+horizontal move or edit forgets the goal. PageUp/PageDown scroll the peers pane
+(the own block stays focused). The pane is pinned by a synthetic content cursor
+at the scroll line because prompt_toolkit clamps a window's ``vertical_scroll``
+to keep the content cursor visible — without it the pane snaps back to the top
+on the next render.
+
 Known v1 limitations (see terminal_renderer_PLAN.md): the own block does not wrap
 (long lines scroll horizontally) so the grapheme cursor maps cleanly to a screen
 row; on lines containing wide/zero-width characters the cursor column (graphemes)
-can sit a cell off the rendered glyph; vertical movement does not remember a
-virtual column; the peers pane is not yet scrollable by key. Attachment tokens
-render highlighted in both panes, but the attach / save-as UI is a follow-up.
+can sit a cell off the rendered glyph. Attachment tokens render highlighted in
+both panes, but the attach / save-as UI is a follow-up.
 """
 
 from __future__ import annotations
@@ -99,24 +106,23 @@ def _move_right(text: str, line: int, col: int) -> tuple[int, int]:
     return line, col
 
 
-def _move_up(text: str, line: int, col: int) -> tuple[int, int]:
-    """Target for Up — same column, clamped to the line above's length."""
-    if line <= 0:
-        lengths = _line_lengths(text)
-        return 0, min(col, lengths[0] if lengths else 0)
+def _move_up(text: str, line: int, col: int, goal: int | None = None) -> tuple[int, int]:
+    """Target for Up. ``goal`` is the remembered (virtual) column for a run of
+    vertical moves: the cursor lands on ``min(goal, line length)``, so passing
+    through a short line clamps it but a long-enough line pops it back out to
+    the original column. ``goal=None`` falls back to the current column."""
     lengths = _line_lengths(text)
-    target = line - 1
-    return target, min(col, lengths[target])
+    want = col if goal is None else goal
+    target = max(line - 1, 0)
+    return target, min(want, lengths[target])
 
 
-def _move_down(text: str, line: int, col: int) -> tuple[int, int]:
-    """Target for Down — same column, clamped to the line below's length."""
+def _move_down(text: str, line: int, col: int, goal: int | None = None) -> tuple[int, int]:
+    """Target for Down — same remembered-column rule as :func:`_move_up`."""
     lengths = _line_lengths(text)
-    if line >= len(lengths) - 1:
-        last = len(lengths) - 1
-        return last, min(col, lengths[last]) if lengths else (0, 0)
-    target = line + 1
-    return target, min(col, lengths[target])
+    want = col if goal is None else goal
+    target = min(line + 1, len(lengths) - 1)
+    return target, min(want, lengths[target])
 
 
 def _move_home(text: str, line: int, col: int) -> tuple[int, int]:
@@ -128,6 +134,15 @@ def _move_end(text: str, line: int, col: int) -> tuple[int, int]:
     """Target for End — end of the current line."""
     lengths = _line_lengths(text)
     return line, lengths[line] if 0 <= line < len(lengths) else 0
+
+
+def _page_scroll(current: int, page: int, content: int, pages: int) -> int:
+    """New top line for the peers pane after moving ``pages`` pages of ``page``
+    rows through ``content`` lines. Clamped to ``[0, content - page]``; 0 when
+    the content already fits (including a stale ``current`` after shrink)."""
+    if page <= 0 or content <= page:
+        return 0
+    return max(0, min(content - page, current + pages * page))
 
 
 def _format_time(ts: float) -> str:
@@ -254,6 +269,8 @@ def _build(
         "dirty": False,
         "app": None,
         "autosave": None,
+        "goal_col": None,    # remembered column for an Up/Down run; None = unset
+        "peers_scroll": 0,   # top content line of the peers pane
     }
 
     def invalidate() -> None:
@@ -292,6 +309,7 @@ def _build(
 
     def mark_dirty() -> None:
         ui["dirty"] = True
+        ui["goal_col"] = None  # an edit moves the cursor — forget the Up/Down goal
         set_transient("editing…")
         schedule_autosave()
 
@@ -315,12 +333,21 @@ def _build(
     def peers_text() -> list[tuple[str, str]]:
         return _peers_fragments(engine)
 
+    def peers_cursor() -> Point:
+        # The pane is never focused, so this cursor is invisible. It exists to
+        # pin the scroll position: prompt_toolkit clamps a window's
+        # vertical_scroll so the content cursor stays visible, so a pane whose
+        # cursor sat at (0, 0) would snap back to the top on every render.
+        last = sum(t.count("\n") for _s, t in _peers_fragments(engine))
+        ui["peers_scroll"] = max(0, min(ui["peers_scroll"], last))
+        return Point(x=0, y=ui["peers_scroll"])
+
     own_window = Window(
         FormattedTextControl(text=own_text, focusable=True, get_cursor_position=own_cursor),
         wrap_lines=False,
     )
     peers_window = Window(
-        FormattedTextControl(text=peers_text, focusable=True),
+        FormattedTextControl(text=peers_text, focusable=True, get_cursor_position=peers_cursor),
         wrap_lines=True,
     )
 
@@ -365,20 +392,50 @@ def _build(
         engine.delete_forward()
         mark_dirty()
 
-    def _bind_move(key: str, fn: Callable[[str, int, int], tuple[int, int]]) -> None:
+    def _bind_move(
+        key: str,
+        fn: Callable[..., tuple[int, int]],
+        vertical: bool = False,
+    ) -> None:
         @kb.add(key)
         def _(event: Any) -> None:
             doc = engine.document
-            line, col = fn(doc.text, doc.cursor.line, doc.cursor.col)
+            if vertical:
+                # Start a goal column on the first vertical move, keep it for
+                # the rest of the run so short lines clamp without losing it.
+                goal = ui["goal_col"] if ui["goal_col"] is not None else doc.cursor.col
+                line, col = fn(doc.text, doc.cursor.line, doc.cursor.col, goal)
+                ui["goal_col"] = goal
+            else:
+                ui["goal_col"] = None
+                line, col = fn(doc.text, doc.cursor.line, doc.cursor.col)
             engine.move_cursor(line, col)
             invalidate()
 
     _bind_move("left", _move_left)
     _bind_move("right", _move_right)
-    _bind_move("up", _move_up)
-    _bind_move("down", _move_down)
+    _bind_move("up", _move_up, vertical=True)
+    _bind_move("down", _move_down, vertical=True)
     _bind_move("home", _move_home)
     _bind_move("end", _move_end)
+
+    def _bind_page(key: str, pages: int) -> None:
+        @kb.add(key)
+        def _(event: Any) -> None:
+            info = peers_window.render_info
+            if info is not None:
+                page = info.window_height
+                content = info.ui_content.line_count
+            else:
+                # Not rendered yet — derive a workable page/content estimate.
+                page = 10
+                content = sum(t.count("\n") for _s, t in _peers_fragments(engine))
+            ui["peers_scroll"] = _page_scroll(ui["peers_scroll"], page, content, pages)
+            peers_window.vertical_scroll = ui["peers_scroll"]
+            invalidate()
+
+    _bind_page("pageup", -1)
+    _bind_page("pagedown", 1)
 
     @kb.add("c-s")
     def _(event: Any) -> None:
@@ -402,6 +459,8 @@ def _build(
         output=output,
     )
     ui["app"] = app
+    # Exposed for tests (the layout tree offers no stable path to it).
+    app._netnotepad_peers_window = peers_window  # type: ignore[attr-defined]
 
     # Peer events fire on background threads; just request a redraw. The panes
     # read fresh engine state when they re-render, so there's nothing to pass.

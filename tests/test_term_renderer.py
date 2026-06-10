@@ -24,6 +24,10 @@ from netnotepad.renderer import term_renderer as tr
 
 # byte sequences a terminal sends for special keys
 LEFT = "\x1b[D"
+UP = "\x1b[A"
+DOWN = "\x1b[B"
+PGUP = "\x1b[5~"
+PGDN = "\x1b[6~"
 HOME = "\x1b[H"
 DEL = "\x1b[3~"   # forward delete
 BS = "\x7f"        # backspace
@@ -183,3 +187,72 @@ def test_build_application_registers_peer_callbacks(tmp_path):
         tr.build_application(e, input=inp, output=DummyOutput())
     assert len(e.on_peer_changed) == bc + 1
     assert len(e.on_peer_tombstoned) == bt + 1
+
+
+# ================== remembered column / peers paging ==================
+
+def test_move_up_down_remember_goal_column():
+    text = "abcdef\nab\nabcdef"
+    # with a goal, the clamp uses the goal rather than the current column
+    assert tr._move_up(text, 1, 2, goal=6) == (0, 6)
+    assert tr._move_down(text, 1, 2, goal=6) == (2, 6)
+    # without a goal, behaviour is unchanged
+    assert tr._move_up("ab\nlongline", 1, 4) == (0, 2)
+    assert tr._move_down("longline\nab", 0, 4) == (1, 2)
+
+
+def test_page_scroll_clamps():
+    assert tr._page_scroll(0, 10, 100, 1) == 10
+    assert tr._page_scroll(85, 10, 100, 1) == 90   # clamp to content - page
+    assert tr._page_scroll(5, 10, 100, -1) == 0
+    assert tr._page_scroll(0, 10, 8, 1) == 0       # content fits: never scroll
+    assert tr._page_scroll(7, 10, 8, 1) == 0       # stale scroll after shrink resets
+
+
+def test_up_through_short_line_keeps_column(tmp_path):
+    e = _engine(tmp_path)
+    _drive(e, "abcdef" + ENTER + "ab" + ENTER + "abcdef" + UP + UP + "X" + CQUIT)
+    # Up through the 2-char line clamps to col 2 but pops back out to col 6.
+    assert e.document.text == "abcdefX\nab\nabcdef"
+
+
+def test_horizontal_move_resets_goal_column(tmp_path):
+    e = _engine(tmp_path)
+    _drive(e, "abcdef" + ENTER + "ab" + ENTER + "abcdef" + UP + LEFT + UP + "X" + CQUIT)
+    # LEFT forgets the goal of 6; the second UP starts a fresh goal of 1.
+    assert e.document.text == "aXbcdef\nab\nabcdef"
+
+
+def test_edit_resets_goal_column(tmp_path):
+    e = _engine(tmp_path)
+    _drive(e, "abcdef" + ENTER + "ab" + ENTER + "abcdef" + UP + "Z" + UP + "X" + CQUIT)
+    # Typing Z (at line 1 col 2) forgets the goal; second UP carries col 3.
+    assert e.document.text == "abcXdef\nabZ\nabcdef"
+
+
+def _long_peer_engine(tmp_path):
+    e = _engine(tmp_path)
+    e.peers["p1"] = Peer(
+        hostname="p1", block_text="line\n" * 200, has_received_snapshot=True
+    )
+    return e
+
+
+def test_pagedown_scrolls_peers_pane(tmp_path):
+    e = _long_peer_engine(tmp_path)
+    with create_pipe_input() as inp:
+        app = tr.build_application(e, input=inp, output=DummyOutput())
+        inp.send_text(PGDN + CQUIT)
+        app.run()
+        w = app._netnotepad_peers_window
+    assert w.vertical_scroll > 0
+
+
+def test_pageup_scrolls_peers_pane_back_to_top(tmp_path):
+    e = _long_peer_engine(tmp_path)
+    with create_pipe_input() as inp:
+        app = tr.build_application(e, input=inp, output=DummyOutput())
+        inp.send_text(PGDN + PGDN + PGUP + PGUP + CQUIT)
+        app.run()
+        w = app._netnotepad_peers_window
+    assert w.vertical_scroll == 0

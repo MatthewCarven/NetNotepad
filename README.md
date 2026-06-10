@@ -10,6 +10,7 @@ The itch: you have more than one computer on the same network and you want a fri
 - **Region-per-peer model.** Each peer owns exactly one block. Nobody's editing the same bytes at the same time, so there's no need for OT, CRDTs, or anything else that makes collaborative editing famously hard.
 - **Cross-platform.** Pure Python plus Tkinter (which ships with Python). Tested on Windows. Should work anywhere Python and Tk run.
 - **Grapheme-aware cursor.** An emoji with a skin-tone modifier is one cursor position, not five code points. (Uses the third-party `regex` library's `\X` pattern.)
+- **File attachments.** Attach a file and a token appears inline in your block; peers fetch the bytes on demand over a content-addressed blob store (right-click a token to save it). Up to 50 MB per file.
 - **Local persistence.** Your own block is saved to `~/.netnotepad/mine.txt` and reloaded on next launch.
 - **Graceful disconnect handling.** Peer goes offline → their last-known block stays visible, dimmed, marked offline. Peer comes back → it lights up and resumes syncing. Brief network blips (sub-5 seconds) don't even cause a UI flicker.
 - **Diagnostic logging built in.** Every silent failure in the background mesh writes to `~/.netnotepad/log.txt`. Unhandled crashes write a full report to `~/.netnotepad/last_crash.txt` that you can paste straight into a Claude chat for diagnosis.
@@ -27,7 +28,7 @@ https://drive.google.com/file/d/1hko5shsAkPfTts0J9A3PPt7-4QTCRsaR/view?usp=shari
 Requires Python 3.10 or newer.
 
 ```
-pip install regex zeroconf
+pip install regex zeroconf prompt_toolkit
 python -m netnotepad
 ```
 
@@ -40,7 +41,7 @@ Run the same thing on a second machine on the same LAN and within a couple of se
 There are two layers, and you can substitute renderers without touching the network code:
 
 - **Engine** (`netnotepad/engine/`) — the headless core. Owns the local document, the peer state, zeroconf discovery, and the TCP mesh. Talks to renderers through callback lists (`on_local_change`, `on_peer_changed`, `on_peer_tombstoned`).
-- **Renderer** (`netnotepad/renderer/`) — currently just `tk_renderer.py`. A terminal renderer using `prompt_toolkit` is on the TODO.
+- **Renderer** (`netnotepad/renderer/`) — `tk_renderer.py` (Tkinter GUI, the default) and `term_renderer.py` (`prompt_toolkit` full-screen terminal UI — run with `python -m netnotepad --renderer term`).
 
 The mesh uses a lex-ordered "only one side initiates" rule so each pair of peers ends up with exactly one TCP socket between them, no double-connect races, no coordinator needed. Heartbeats every 5 seconds; a watchdog closes any connection that's been silent for 25 seconds, which then triggers an automatic reconnect.
 
@@ -60,10 +61,12 @@ netnotepad/
     document.py          local block model + grapheme cursor + persistence
     discovery.py         zeroconf register + browse
     network.py           TCP mesh + heartbeat + watchdog + auto-reconnect
+    attachments.py       content-addressed blob store + HTTP blob server/fetch
   renderer/
     tk_renderer.py       Tkinter UI
+    term_renderer.py     prompt_toolkit terminal UI (--renderer term)
 
-tests/                   pytest suite, 37 passing
+tests/                   pytest suite, 100 tests
 DESIGN.md                why things are the way they are
 WORKLOG.md               what happened, day by day
 TODO.md                  what's next, what's later, what's verified
@@ -88,15 +91,13 @@ Working and in daily use across Matthew's LAN (laptop, desktop, and a slow box a
 
 Things that are planned and not yet built (see [`TODO.md`](TODO.md) for the full list):
 
-- Attachments — paste an image or drop a file and it shows up inline in your block AND in peers' read-only views.
-- Terminal renderer using `prompt_toolkit`.
 - Multi-block per peer (named panes within one peer — "scratch", "URLs", etc.).
 - Cross-subnet / VPN-friendly discovery.
 
 ## Tests
 
 ```
-pip install pytest regex zeroconf
+pip install pytest regex zeroconf prompt_toolkit
 python -m pytest tests/ -q
 ```
 

@@ -522,3 +522,42 @@ Built the `prompt_toolkit` terminal renderer from this morning's plan (`terminal
 - `pyproject.toml` — `prompt_toolkit>=3.0` dependency.
 - `build_exe.bat` — install prompt_toolkit + `--collect-all prompt_toolkit`.
 - `TODO.md` — terminal renderer moved to Verified; v1 follow-ups now the Up-next item.
+
+## 2026-06-10 — Terminal renderer follow-ups, part 1 (goal column, peers paging, doc/dep cleanup)
+
+Previous session's commit landed (`7888ba9`, pushed along with `cabe8f4`) after the stuck `.git/index.lock` was cleared from Windows. This session took the first slice of the term-renderer follow-up list.
+
+### Remembered (virtual) column on Up/Down
+
+- `_move_up` / `_move_down` gained an optional `goal` parameter — the clamp becomes `min(goal, target line length)`, so the cursor squeezes through short lines and pops back out at its original column. Signatures stay back-compatible; the existing helper tests pass unchanged.
+- The binding layer owns the state: `ui["goal_col"]` is set on the first vertical move of a run and kept for subsequent Up/Downs; any horizontal move (`left`/`right`/`home`/`end`) or any edit (`mark_dirty`) resets it to `None`. `_move_down`'s old one-line ternary (which parsed correctly only by accident) was rewritten in the process.
+
+### Peers-pane PageUp/PageDown
+
+- The interesting discovery: prompt_toolkit's `Window._scroll_when_linewrapping` clamps `vertical_scroll` so the *content cursor* stays visible — an unfocused `FormattedTextControl` reports cursor (0,0), so any manually-set scroll snaps back to the top on the next render. Read the installed pt source to confirm before coding around it.
+- Fix: the peers control now has a `get_cursor_position` that pins a synthetic (invisible — the pane is never focused) cursor at `ui["peers_scroll"]`, clamped to the pane's current line count. The PageUp/PageDown handlers move `ui["peers_scroll"]` by one window-height page via the pure helper `_page_scroll` (clamped to `[0, content - page]`, 0 when content fits) and set `peers_window.vertical_scroll` to match; render-time cursor clamping handles peers disappearing under a stale scroll.
+- Before first render `render_info` is `None`; handlers fall back to page=10 and a content estimate from `_peers_fragments`, which also makes the behaviour deterministic for headless tests.
+- `app._netnotepad_peers_window` exposes the window for tests (the layout tree offers no stable path).
+
+### Docs / deps / start.bat
+
+- README: install lines now include `prompt_toolkit` (both the run and test ones); renderer bullet and project-layout tree now list `term_renderer.py` and `attachments.py`; attachments + terminal renderer removed from the "planned, not yet built" list; a File-attachments feature bullet added; test count refreshed.
+- `start.bat`: had `%%~dp0` (an escaped percent, correct inside a *generated* file but wrong in a hand-run .bat) — so its `cd` has been silently failing and the script only worked because double-click sets cwd anyway. Fixed to `%~dp0`, and it now runs `pip install --quiet regex zeroconf prompt_toolkit` first, which makes the README's "start.bat does the pip install for you" claim true.
+- The uncommitted README/start.bat "WIP" that blocked these edits last session turned out to be pure CRLF/LF churn (`git diff --ignore-cr-at-eol` empty) — no real changes lost.
+
+### Verified
+
+- 7 new tests in `tests/test_term_renderer.py`: goal-aware `_move_up`/`_move_down` (pure), `_page_scroll` clamping (pure), Up-through-short-line keeps column, horizontal-move and edit both reset the goal, PageDown scrolls the peers pane, PageDown×2+PageUp×2 returns to top — all via the established pipe-input + DummyOutput headless harness.
+- `tests/test_term_renderer.py`: 25/25 green (0.37s). Full local suite: 87 green (16 document, 13 logging, 25 attachments, 8 network-unit, 25 term). The 13 real-mDNS tests remain for live LAN verification as always.
+
+### Process notes
+
+- The mount-drift footgun struck `term_renderer.py` this time: five `Edit`-tool edits reported success but bash saw the file truncated mid-token at 16,224 bytes. Rebuilt via the documented `cat << 'EOF'` heredoc (521 lines), `py_compile` clean after. The test-file additions were done via Python-in-bash from the start.
+- A zero-byte stale `.git/index.lock` reappears whenever git runs from the sandbox (git cannot unlink through this mount). Cleared from Windows before committing.
+
+### Files touched
+- `netnotepad/renderer/term_renderer.py` — goal column, peers paging, docstring update.
+- `tests/test_term_renderer.py` — 7 new tests (25 total).
+- `README.md` — deps, renderer/layout/features/test-count refresh.
+- `start.bat` — `%~dp0` fix + pip install line.
+- `TODO.md` / `WORKLOG.md` — this entry; Up-next narrowed to attach/save-as UI + wrapping.
