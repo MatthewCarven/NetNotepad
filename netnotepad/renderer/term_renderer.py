@@ -54,10 +54,9 @@ the original filename). Locally-cached blobs save synchronously; a peer's
 uncached blob is fetched on a background thread via ``engine.ensure_attachment``.
 Enter on an empty prompt, Escape, or Ctrl-G cancels.
 
-Known v1 limitations (see terminal_renderer_PLAN.md): the own block does not wrap
-(long lines scroll horizontally) so the grapheme cursor maps cleanly to a screen
-row; on lines containing wide/zero-width characters the cursor column (graphemes)
-can sit a cell off the rendered glyph.
+The own block wraps long lines (since 2026-06-10; Up/Down move by logical
+line, not visual row). Known v1 limitation: on lines containing wide/zero-width
+characters the cursor column (graphemes) can sit a cell off the rendered glyph.
 """
 
 from __future__ import annotations
@@ -432,7 +431,10 @@ def _build(
 
     own_window = Window(
         FormattedTextControl(text=own_text, focusable=True, get_cursor_position=own_cursor),
-        wrap_lines=False,
+        # Wrapping ON (Matthew's call, 2026-06-10): long lines wrap like the Tk
+        # UI. Up/Down still move by *logical* line — acceptable for a
+        # scratchpad; revisit if it grates during real use.
+        wrap_lines=True,
     )
     peers_window = Window(
         FormattedTextControl(text=peers_text, focusable=True, get_cursor_position=peers_cursor),

@@ -14,6 +14,16 @@ Threading: zeroconf and mesh callbacks fire on background threads. We
 bounce them onto the Tk main loop via ``root.after(0, ...)`` which is
 thread-safe.
 
+Image attachments render as inline thumbnail previews (2026-06-10): in the
+peers pane each cached image blob is embedded at the END of its peer's section
+(after the body text, inside the tracked section length — embedded images
+count as one index position each in Tk, so content_len accounts for them and
+the attachment-tag offsets over header+body stay valid); our own images show
+in a preview strip below the editable pane, because embedding objects inside
+the own Text widget would corrupt the char-offset mirror that IS the document.
+Blobs still in prefetch flight appear when a cheap 2s fingerprint tick notices
+them arrive. Pillow widens format support if installed; see preview.py.
+
 The peers pane uses surgical per-peer updates rather than wipe-and-rebuild.
 Each peer's section is anchored by a single left-gravity start mark, with
 the end of the section computed as ``start_mark + content_len chars`` on
@@ -40,6 +50,12 @@ from typing import Any
 
 from netnotepad.engine.attachments import parse_attachment_tokens
 from netnotepad.log import log_exception, log_info
+from netnotepad.renderer.preview import (
+    HAVE_PIL,
+    MAX_PREVIEW_DIM,
+    cached_preview_shas,
+    subsample_factor,
+)
 
 
 def _format_time(ts: float) -> str:
@@ -49,13 +65,38 @@ def _format_time(ts: float) -> str:
     return time.strftime("%H:%M", time.localtime(ts))
 
 
-def _peer_fingerprint(p: Any) -> tuple:
+def _load_preview_image(path: Path) -> Any | None:
+    """A Tk PhotoImage thumbnail of ``path``, or None. Never raises.
+
+    With Pillow: smooth thumbnail, wide format support. Without: native
+    tk.PhotoImage (png/gif/ppm) downscaled by integer subsample — blocky for
+    big photos but dependency-free.
+    """
+    try:
+        if HAVE_PIL:
+            from PIL import Image, ImageTk
+
+            img = Image.open(path)
+            img.thumbnail((MAX_PREVIEW_DIM, MAX_PREVIEW_DIM))
+            return ImageTk.PhotoImage(img)
+        photo = tk.PhotoImage(file=str(path))
+        f = subsample_factor(photo.width(), photo.height())
+        return photo.subsample(f, f) if f > 1 else photo
+    except Exception as e:
+        log_exception(e, context="tk.load_preview(" + str(path) + ")")
+        return None
+
+
+def _peer_fingerprint(p: Any, store: Any = None) -> tuple:
     """Capture every aspect of a peer that affects its visible rendering.
 
     Two peers with equal fingerprints produce byte-identical pane content,
-    so the surgical refresh path can skip them entirely.
+    so the surgical refresh path can skip them entirely. When ``store`` is
+    given, the set of CACHED image-attachment shas is part of the
+    fingerprint — a prefetch finishing changes the rendering (a preview
+    appears) without any other field changing.
     """
-    return (
+    base = (
         p.address,
         p.last_edit_ts,
         p.last_seen_ts,
@@ -63,6 +104,10 @@ def _peer_fingerprint(p: Any) -> tuple:
         bool(getattr(p, "has_received_snapshot", False)),
         p.block_text,
     )
+    if store is None:
+        return base
+    snap = bool(getattr(p, "has_received_snapshot", False))
+    return base + (cached_preview_shas(p.block_text if snap else "", store),)
 
 
 def _format_peer_section(p: Any) -> tuple:
@@ -178,6 +223,7 @@ def run(engine: Any) -> None:
         # inserts sometimes don't fire <<Modified>> in the order you'd
         # expect, depending on Tk version).
         _retag_attachments(text, "1.0", text.get("1.0", "end-1c"))
+        refresh_own_previews()
         set_transient("attached " + Path(path).name)
 
     toolbar = tk.Frame(root, bg="#f4f4f4")
@@ -213,6 +259,14 @@ def run(engine: Any) -> None:
         text.insert("1.0", initial)
         text.mark_set("insert", "end-1c")
     text.edit_modified(False)
+
+    # Preview strip for OUR OWN image attachments. The own Text widget's
+    # content IS the document (mirrored by <<Modified>>), so embedding image
+    # objects inside it would corrupt the char-offset arithmetic everywhere;
+    # a strip below the pane gets us previews with zero model risk.
+    own_previews = tk.Frame(root, bg="#fafafa")
+    own_previews.pack(side="top", fill="x")
+    own_preview_state: dict[str, tuple] = {"shas": ()}
 
     # ---------- read-only peers pane ----------
     tk.Frame(root, height=1, bg="#ddd").pack(side="top", fill="x")
@@ -409,6 +463,56 @@ def run(engine: Any) -> None:
             ),
         )
 
+    # ---------- attachment image previews ----------
+    # sha -> PhotoImage. Tk keeps NO Python reference to images placed in
+    # widgets; if these were garbage-collected the previews would silently
+    # vanish. The cache doubles as a load-once optimisation.
+    photo_cache: dict[str, Any] = {}
+
+    def _photo_for(sha: str) -> Any | None:
+        if sha in photo_cache:
+            return photo_cache[sha]
+        photo = _load_preview_image(engine.attachment_store.path_for(sha))
+        if photo is not None:
+            photo_cache[sha] = photo
+        return photo
+
+    def _append_previews(start_mark: str, offset: int, block_text: str) -> int:
+        """Embed previews for one peer's cached image attachments at
+        ``start_mark + offset`` index positions (i.e. at the end of the
+        freshly-inserted section, before the separator). Returns how many
+        index positions were consumed — each embedded image counts as ONE
+        position in Tk index arithmetic, plus one per newline — which the
+        caller must add to the section's tracked content_len."""
+        base = peers_view.index(start_mark)
+        added = 0
+        for sha in cached_preview_shas(block_text, engine.attachment_store):
+            photo = _photo_for(sha)
+            if photo is None:
+                continue
+            peers_view.image_create(
+                f"{base} + {offset + added}c", image=photo, padx=8, pady=4
+            )
+            added += 1
+            peers_view.insert(f"{base} + {offset + added}c", "\n")
+            added += 1
+        return added
+
+    def refresh_own_previews() -> None:
+        body = text.get("1.0", "end-1c")
+        shas = cached_preview_shas(body, engine.attachment_store)
+        if shas == own_preview_state["shas"]:
+            return
+        own_preview_state["shas"] = shas
+        for child in own_previews.winfo_children():
+            child.destroy()
+        for sha in shas:
+            photo = _photo_for(sha)
+            if photo is not None:
+                tk.Label(own_previews, image=photo, bg="#fafafa").pack(
+                    side="left", padx=6, pady=4
+                )
+
     # ---------- per-peer surgical-update state ----------
     # hostname -> (start_mark_name, content_len_in_chars). The start mark has
     # left gravity and stays anchored at the start of the peer's section even
@@ -484,8 +588,14 @@ def run(engine: Any) -> None:
                 peers_view.insert("end", header_line, head_tag)
                 peers_view.insert("end", body, body_tag)
                 content_len = len(header_line) + len(body)
+                if getattr(p, "has_received_snapshot", False):
+                    content_len += _append_previews(
+                        start_mark, content_len, p.block_text
+                    )
                 peer_section_marks[p.hostname] = (start_mark, content_len)
-                peer_fingerprints[p.hostname] = _peer_fingerprint(p)
+                peer_fingerprints[p.hostname] = _peer_fingerprint(
+                    p, engine.attachment_store
+                )
                 _retag_attachments(peers_view, start_mark, header_line + body)
                 # Visual separator BETWEEN sections, OUTSIDE the section
                 # length we cached above. Without this, the next peer's
@@ -541,7 +651,7 @@ def run(engine: Any) -> None:
         surgical_failed = False
         peers_view.configure(state="normal")
         for p in peers:
-            new_fp = _peer_fingerprint(p)
+            new_fp = _peer_fingerprint(p, engine.attachment_store)
             if peer_fingerprints.get(p.hostname) == new_fp:
                 continue
             any_change = True
@@ -578,6 +688,15 @@ def run(engine: Any) -> None:
                 surgical_failed = True
                 break
             new_content_len = len(header_line) + len(body)
+            try:
+                if getattr(p, "has_received_snapshot", False):
+                    new_content_len += _append_previews(
+                        start_mark, new_content_len, p.block_text
+                    )
+            except tk.TclError as e:
+                log_exception(e, context=f"tk.previews[{p.hostname}]")
+                surgical_failed = True
+                break
             peer_section_marks[p.hostname] = (start_mark, new_content_len)
             peer_fingerprints[p.hostname] = new_fp
             _retag_attachments(peers_view, start_mark, header_line + body)
@@ -622,6 +741,7 @@ def run(engine: Any) -> None:
         engine.set_local_text(new_text)
         text.edit_modified(False)
         _retag_attachments(text, "1.0", new_text)
+        refresh_own_previews()
         set_transient("editing…")
         schedule_save()
 
@@ -675,4 +795,18 @@ def run(engine: Any) -> None:
     # for any peers already present. All subsequent updates flow through
     # refresh_peers_view via on_peer_event.
     _full_rebuild_peers_view(engine.sorted_peers())
+    refresh_own_previews()
+
+    # A peer-blob prefetch finishing on a background thread fires no peer
+    # event, so its preview would otherwise only appear on the next edit.
+    # A cheap 2s tick re-checks fingerprints (no-op when nothing changed).
+    def _periodic_refresh() -> None:
+        try:
+            refresh_peers_view()
+            refresh_own_previews()
+        except Exception as e:
+            log_exception(e, context="tk.periodic_refresh")
+        root.after(2000, _periodic_refresh)
+
+    root.after(2000, _periodic_refresh)
     root.mainloop()

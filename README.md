@@ -10,7 +10,7 @@ The itch: you have more than one computer on the same network and you want a fri
 - **Region-per-peer model.** Each peer owns exactly one block. Nobody's editing the same bytes at the same time, so there's no need for OT, CRDTs, or anything else that makes collaborative editing famously hard.
 - **Cross-platform.** Pure Python plus Tkinter (which ships with Python). Tested on Windows. Should work anywhere Python and Tk run.
 - **Grapheme-aware cursor.** An emoji with a skin-tone modifier is one cursor position, not five code points. (Uses the third-party `regex` library's `\X` pattern.)
-- **File attachments.** Attach a file and a token appears inline in your block; peers fetch the bytes on demand over a content-addressed blob store (right-click a token to save it). Up to 50 MB per file.
+- **File attachments.** Attach a file and a token appears inline in your block; peers fetch the bytes on demand over a content-addressed blob store (right-click a token to save it). Up to 50 MB per file. Image attachments show as inline thumbnails in the Tk UI (png/gif out of the box; `pip install pillow` for jpeg/webp and smoother scaling — optional).
 - **Local persistence.** Your own block is saved to `~/.netnotepad/mine.txt` and reloaded on next launch.
 - **Graceful disconnect handling.** Peer goes offline → their last-known block stays visible, dimmed, marked offline. Peer comes back → it lights up and resumes syncing. Brief network blips (sub-5 seconds) don't even cause a UI flicker.
 - **Diagnostic logging built in.** Every silent failure in the background mesh writes to `~/.netnotepad/log.txt`. Unhandled crashes write a full report to `~/.netnotepad/last_crash.txt` that you can paste straight into a Claude chat for diagnosis.
@@ -64,9 +64,10 @@ netnotepad/
     attachments.py       content-addressed blob store + HTTP blob server/fetch
   renderer/
     tk_renderer.py       Tkinter UI
+    preview.py           image-preview helpers (display-free)
     term_renderer.py     prompt_toolkit terminal UI (--renderer term)
 
-tests/                   pytest suite, 109 tests
+tests/                   pytest suite, 114 tests
 DESIGN.md                why things are the way they are
 WORKLOG.md               what happened, day by day
 TODO.md                  what's next, what's later, what's verified

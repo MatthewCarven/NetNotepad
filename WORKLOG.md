@@ -595,3 +595,35 @@ Second slice of the day: the last big term-renderer follow-up. The morning's com
 - `tests/test_term_renderer.py` — 9 new tests (34 total).
 - `README.md` — test count.
 - `TODO.md` / `WORKLOG.md` — this entry; Up next is now only the own-block line-wrapping consideration.
+
+## 2026-06-10 (evening) — Tk inline image previews + term-renderer line wrap
+
+Matthew picked both forks: wrap the term renderer's own block, and build the inline image preview (the original attachments vision) in Tk next, while he live-tests the term renderer's attach UI on the LAN.
+
+### Term renderer line wrap
+
+- `wrap_lines=True` on the own window. Up/Down move by logical line, not visual row — fine for a scratchpad, flagged in the comment for revisiting if it grates. All 34 term tests unaffected (DummyOutput doesn't care).
+
+### Tk image previews — where they render and why
+
+- **Peers pane: real inline embeds**, placed at the END of each peer's section, inside the tracked section. The load-bearing fact: Tk counts an embedded image as ONE index position in `L.C` / `+ Nc` arithmetic. So `_append_previews` returns the index positions it consumed (1 per image + 1 per newline) and both render paths add that to the section's `content_len` — the surgical bracket `[start_mark, start_mark + content_len chars)` keeps holding, and deletion of a section removes its embeds with it. The attachment-tag offsets are computed over header+body only, and previews sit after that range, so `_retag_attachments` needed no change.
+- **Own pane: a preview strip below the editor, NOT embeds.** The own Text widget's content IS the document — `<<Modified>>` mirrors `text.get("1.0", "end-1c")` straight into the engine. Embedded objects would shift every index while contributing nothing to `get()`, i.e. silent offset corruption of exactly the kind the mark-gravity saga in this file's history warns about. The strip gets previews with zero model risk; true inline-in-own-pane is a new TODO with that problem stated.
+- **Freshness**: a peer's blob often lands via background prefetch, which fires no peer event. `_peer_fingerprint` now optionally takes the store and folds in `cached_preview_shas(block_text)`, and a 2s `root.after` tick re-runs the (fingerprint-guarded, hence cheap) refreshes — a finished prefetch flips the fingerprint and only that section redraws.
+- **GC trap dodged**: Tk keeps no Python reference to images placed in widgets; a sha-keyed `photo_cache` dict holds them or the previews would silently vanish on the next collection.
+
+### preview.py — the display-free half
+
+- New `netnotepad/renderer/preview.py`, deliberately tkinter-free so the sandbox (which has no tkinter at all) can test it: extension gating (png/gif/ppm/pgm native to `tk.PhotoImage`; jpeg/webp/bmp/tiff/ico added when Pillow is importable — Pillow stays optional, documented in README), `subsample_factor` ceil-division downscale to `MAX_PREVIEW_DIM` 280px, and `cached_preview_shas` (appearance-ordered, deduped, cached-blobs-only — uncached just means "try again next tick").
+- Loader in tk_renderer: Pillow path does smooth `thumbnail()`; native path `PhotoImage.subsample` (blocky for big photos, but dependency-free). Never raises; failures log and skip.
+
+### Verified
+
+- 5 new tests in `tests/test_preview.py` (extension gating incl. the Pillow-availability coupling, subsample clamp/ceil, sha filtering/dedup/order). Local suite: **101 green** (16 document, 13 logging, 25 attachments, 8 network-unit, 34 term, 5 preview). `py_compile` clean on `tk_renderer.py` — it can't even be imported in the sandbox (no tkinter), so the Tk wiring is Matthew's to verify live: attach a png on box A, watch the thumbnail appear on box B (give the 2s tick a moment after the transfer).
+
+### Files touched
+- `netnotepad/renderer/preview.py` — new (~75 lines).
+- `netnotepad/renderer/tk_renderer.py` — previews (embeds + strip + tick + fingerprint/store), docstring.
+- `netnotepad/renderer/term_renderer.py` — wrap_lines=True + docstring.
+- `tests/test_preview.py` — new, 5 tests.
+- `README.md` — thumbnails + optional Pillow note, layout tree, test count (114).
+- `TODO.md` / `WORKLOG.md` — this entry; new TODO items: own-pane inline rendering, term-renderer preview question.
