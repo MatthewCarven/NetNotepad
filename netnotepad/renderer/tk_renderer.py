@@ -24,6 +24,14 @@ the own Text widget would corrupt the char-offset mirror that IS the document.
 Blobs still in prefetch flight appear when a cheap 2s fingerprint tick notices
 them arrive. Pillow widens format support if installed; see preview.py.
 
+File menu (2026-06-12): Open... (Ctrl+O) replaces the own block with a text
+file's contents — the <<Modified>> mirror broadcasts the Snapshot and the
+autosave persists it, so Open is just "delete + insert + let the existing
+machinery run". Save As... (Ctrl+Shift+S) exports the own block; the
+"Save Block As" submenu (rebuilt from live peer state on every post) exports
+any peer's last-received block, tombstoned peers included. Guards and
+encoding policy live in engine/fileio.py.
+
 The peers pane uses surgical per-peer updates rather than wipe-and-rebuild.
 Each peer's section is anchored by a single left-gravity start mark, with
 the end of the section computed as ``start_mark + content_len chars`` on
@@ -49,6 +57,12 @@ from tkinter import filedialog, font as tkfont
 from typing import Any
 
 from netnotepad.engine.attachments import parse_attachment_tokens
+from netnotepad.engine.fileio import (
+    block_choices,
+    export_text,
+    read_text_for_open,
+    safe_filename,
+)
 from netnotepad.log import log_exception, log_info
 from netnotepad.renderer.preview import (
     HAVE_PIL,
@@ -746,6 +760,97 @@ def run(engine: Any) -> None:
         schedule_save()
 
     text.bind("<<Modified>>", on_modified)
+
+    # ---------- File menu: Open / Save As / peer export ----------
+    # Open REPLACES the own block (and therefore broadcasts a Snapshot via
+    # the <<Modified>> mirror, and autosaves to mine.txt as usual). The
+    # heavy lifting (size/binary guards, encoding fallback, newline
+    # normalization) lives in engine/fileio.py where it's testable.
+    def on_open_clicked(event: Any = None) -> str:
+        path = filedialog.askopenfilename(
+            parent=root,
+            title="Open file",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if path:
+            try:
+                content = read_text_for_open(Path(path))
+            except (OSError, ValueError) as e:
+                log_exception(e, context="tk.open_file")
+                set_transient("open failed: " + str(e))
+                return "break"
+            text.delete("1.0", "end")
+            text.insert("1.0", content)
+            text.mark_set("insert", "end-1c")
+            # The delete/insert pair fires <<Modified>>, which mirrors the
+            # new text into the engine (Snapshot broadcast) and schedules
+            # the autosave — no extra plumbing needed here.
+            set_transient("opened " + Path(path).name)
+        # "break" stops Tk's default Control-o binding (openline: inserts
+        # a newline at the cursor) when we arrive via the keyboard.
+        return "break"
+
+    def _export_block(label: str, content: str) -> None:
+        dest = filedialog.asksaveasfilename(
+            parent=root,
+            title="Save block as...",
+            defaultextension=".txt",
+            initialfile=safe_filename(label) + ".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not dest:
+            return
+        try:
+            export_text(Path(dest), content)
+        except OSError as e:
+            log_exception(e, context="tk.export_block")
+            set_transient("save failed: " + str(e))
+            return
+        set_transient("saved " + Path(dest).name)
+
+    def on_save_as_clicked(event: Any = None) -> str:
+        _export_block(engine.hostname, text.get("1.0", "end-1c"))
+        return "break"
+
+    menubar = tk.Menu(root)
+    file_menu = tk.Menu(menubar, tearoff=0)
+    export_menu = tk.Menu(file_menu, tearoff=0)
+
+    def _rebuild_export_menu() -> None:
+        """postcommand hook: rebuilt from live peer state every time the
+        submenu is posted, so it always reflects who's around. Peers we've
+        never received a Snapshot from are omitted (nothing to export);
+        tombstoned peers stay (rescuing a departed peer's last-known text
+        is exactly when you want this)."""
+        export_menu.delete(0, "end")
+        for label, content in block_choices(
+            engine.hostname + " (you)",
+            text.get("1.0", "end-1c"),
+            engine.sorted_peers(),
+        ):
+            export_menu.add_command(
+                label=label,
+                command=lambda l=label, c=content: _export_block(l, c),
+            )
+
+    export_menu.configure(postcommand=_rebuild_export_menu)
+    file_menu.add_command(
+        label="Open...", accelerator="Ctrl+O", command=on_open_clicked
+    )
+    file_menu.add_command(
+        label="Save As...", accelerator="Ctrl+Shift+S", command=on_save_as_clicked
+    )
+    file_menu.add_cascade(label="Save Block As", menu=export_menu)
+    menubar.add_cascade(label="File", menu=file_menu)
+    root.config(menu=menubar)
+
+    # Keyboard accelerators. Bound on the Text widget (it has focus) so we
+    # can return "break" and pre-empt Tk's defaults: Control-o is Text's
+    # built-in "openline" which would insert a stray newline.
+    text.bind("<Control-o>", on_open_clicked)
+    text.bind("<Control-O>", on_open_clicked)
+    text.bind("<Control-Shift-S>", on_save_as_clicked)
+    text.bind("<Control-Shift-s>", on_save_as_clicked)
 
     # ---------- peer event subscribers ----------
     def on_peer_event(peer: Any = None) -> None:

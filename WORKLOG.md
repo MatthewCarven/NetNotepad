@@ -627,3 +627,87 @@ Matthew picked both forks: wrap the term renderer's own block, and build the inl
 - `tests/test_preview.py` — new, 5 tests.
 - `README.md` — thumbnails + optional Pillow note, layout tree, test count (114).
 - `TODO.md` / `WORKLOG.md` — this entry; new TODO items: own-pane inline rendering, term-renderer preview question.
+
+## 2026-06-12 — File → Open / Save As / peer-block export (both renderers)
+
+Matthew called the project as nearing completion and picked the last built-in
+feature: proper file open/save alongside the autosave. Scope settled via
+three forks: both renderers; Save As covers own block AND peer blocks; Open
+replaces + broadcasts (standard semantics, no append, no confirm).
+
+### engine/fileio.py — the display-free half
+
+- Same playbook as preview.py: everything testable lives away from the UI
+  toolkits. `read_text_for_open`, `export_text`, `block_choices`,
+  `safe_filename`.
+- Open is guarded harder than a local-only editor would bother with, because
+  the opened text becomes our block and Snapshot-broadcasts to every peer:
+  5 MB cap (`MAX_OPEN_BYTES`) and a NUL-byte binary sniff both raise
+  ValueError before anything touches the document.
+- Encoding: `utf-8-sig` first (BOM swallowed rather than rendered), cp1252
+  fallback — Windows boxes, legacy Notepad files. cp1252 maps every byte so
+  the fallback can't raise; worst case is visible mojibake.
+- Newlines normalized to `\n` on open: a surviving `\r` would render as an
+  artifact AND desync grapheme-position arithmetic between peers.
+- Export mirrors `Document.save`: temp + rename, utf-8, parents created.
+- `block_choices` includes tombstoned peers deliberately — exporting a
+  departed peer's last-known text is exactly the rescue this feature is for.
+  Peers we never got a Snapshot from are excluded (nothing real to export).
+
+### Tk — File menubar
+
+- Open... (Ctrl+O), Save As... (Ctrl+Shift+S), Save Block As → submenu of
+  peers rebuilt from live state on every post (`postcommand`).
+- Open is implemented as delete + insert on the Text widget and nothing
+  else — the existing `<<Modified>>` mirror then does set_local_text
+  (Snapshot broadcast) and schedules the autosave. No new plumbing.
+- Ctrl+O needed `return "break"`: Tk Text's default Control-o binding is
+  "openline" (inserts a newline), which would have been a fun bug report.
+
+### Term — Ctrl-O / Ctrl-E via the dialog bar
+
+- Same ConditionalContainer dialog-bar pattern as Ctrl-A/Ctrl-D; no new UI
+  machinery. Ctrl-E does a numbered pick (own block first) but skips the
+  pick entirely when there are no peers; destination prompt reuses
+  `_resolve_dest`, so an existing directory gets `<blockname>.txt` via
+  `safe_filename`. Open goes through `engine.set_local_text` — one Snapshot,
+  not a giant Delta.
+- Peers-header hint line now mentions ^O/^E.
+
+### Sandbox file-drift fights (process note)
+
+The Write/Edit-tool ↔ bash mount drift bit three times today: every
+Edit landing near a file's tail silently truncated the file mid-line at the
+edit point (tk_renderer.py, fileio.py, test_fileio.py all hit it). The
+heredoc escape from the 06-10 session is now standard procedure, and
+term_renderer.py was patched entirely via a python script with
+`assert src.count(anchor) == 1` guards rather than risking Edit at all.
+Verify with py_compile + tests after every file write, trust nothing.
+
+### Verified
+
+- 22 new tests: 15 in `tests/test_fileio.py` (guards, encodings, newline
+  normalization, atomic export, choices ordering, filename sanitizing) and
+  7 term-integration in `tests/test_term_renderer.py` (Ctrl-O loads + emits
+  Snapshot, missing-file and empty-Enter leave the block alone, Ctrl-E
+  straight-to-dest with no peers, numbered pick exports a peer's block,
+  directory destination gets the default filename).
+- Local suite: **123 green** (16 document, 13 logging, 25 attachments,
+  8 network-unit, 41 term, 5 preview, 15 fileio). py_compile clean on
+  tk_renderer.py (not importable here — no tkinter); the menubar itself is
+  Matthew's to verify live.
+- Commit NOT made: `.git\index.lock` still stuck from before the 10th's
+  session ended (0518cec itself turned out already pushed — Matthew got
+  that far). Hand-off in TODO covers today's commit.
+
+### Files touched
+
+- `netnotepad/engine/fileio.py` — new (~100 lines).
+- `netnotepad/renderer/tk_renderer.py` — File menubar + handlers, docstring.
+- `netnotepad/renderer/term_renderer.py` — Ctrl-O/Ctrl-E actions + bindings,
+  header hint, docstring.
+- `tests/test_fileio.py` — new, 15 tests.
+- `tests/test_term_renderer.py` — 7 new tests (41 total).
+- `README.md` — layout tree, feature list, test count (136).
+- `TODO.md` / `WORKLOG.md` — this entry; field-run checklist gained the
+  File-menu items; commit hand-off updated.

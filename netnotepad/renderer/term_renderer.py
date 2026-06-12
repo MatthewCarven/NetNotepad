@@ -54,6 +54,14 @@ the original filename). Locally-cached blobs save synchronously; a peer's
 uncached blob is fetched on a background thread via ``engine.ensure_attachment``.
 Enter on an empty prompt, Escape, or Ctrl-G cancels.
 
+File open / export (2026-06-12): **Ctrl-O** prompts for a path and REPLACES the
+own block with the file's text (via ``engine.set_local_text`` — the Snapshot
+path, mirroring Tk's File→Open; size/binary guards and encoding fallback live
+in engine/fileio.py). **Ctrl-E** exports a block: with no peers it prompts
+straight for a destination, otherwise a numbered pick (own block first, then
+peers, departed peers included). A destination that is an existing directory
+gets a ``<blockname>.txt`` default filename.
+
 The own block wraps long lines (since 2026-06-10; Up/Down move by logical
 line, not visual row). Known v1 limitation: on lines containing wide/zero-width
 characters the cursor column (graphemes) can sit a cell off the rendered glyph.
@@ -78,6 +86,12 @@ from prompt_toolkit.styles import Style
 
 from netnotepad.engine.attachments import parse_attachment_tokens
 from netnotepad.engine.document import _graphemes
+from netnotepad.engine.fileio import (
+    block_choices,
+    export_text,
+    read_text_for_open,
+    safe_filename,
+)
 from netnotepad.log import log_exception
 
 # Idle delay before an edit triggers an autosave. Saves run on the event-loop
@@ -396,7 +410,7 @@ def _build(
         return [
             (
                 "class:peers-header",
-                "  peers   ·   ^A attach  ^D save-attachment  PgUp/PgDn scroll",
+                "  peers   ·   ^A attach  ^D save-attachment  ^O open  ^E export  PgUp/PgDn scroll",
             )
         ]
 
@@ -558,6 +572,87 @@ def _build(
 
         open_dialog("save which?  " + listing + "  > ", pick)
 
+    # ---- file open / export (the term equivalents of Tk's File menu) ----
+    def _do_open(path_str: str) -> None:
+        path_str = path_str.strip()
+        if not path_str:
+            set_transient("open cancelled")
+            return
+        try:
+            content = read_text_for_open(Path(path_str))
+        except FileNotFoundError:
+            set_transient("open failed: no such file")
+            return
+        except IsADirectoryError:
+            set_transient("open failed: that's a directory")
+            return
+        except PermissionError:
+            set_transient("open failed: permission denied")
+            return
+        except ValueError as e:  # too large / binary — fileio's guards
+            set_transient("open failed: " + str(e))
+            return
+        except OSError as e:
+            log_exception(e, context="term.open")
+            set_transient("open failed")
+            return
+        # Wholesale replace goes through the Snapshot path (set_local_text),
+        # exactly like Tk's File->Open — peers get the new block in one
+        # message instead of a giant Delta, and the cursor clamps to a valid
+        # position in the new text.
+        engine.set_local_text(content)
+        mark_dirty()
+        set_transient("opened " + Path(path_str).expanduser().name)
+
+    def _do_export(label: str, content: str, dest_str: str) -> None:
+        dest_str = dest_str.strip()
+        if not dest_str:
+            set_transient("export cancelled")
+            return
+        dest = _resolve_dest(dest_str, safe_filename(label) + ".txt")
+        try:
+            export_text(dest, content)
+        except OSError as e:
+            log_exception(e, context="term.export")
+            set_transient("export failed")
+            return
+        set_transient("saved " + dest.name)
+
+    def _start_export() -> None:
+        choices = block_choices(
+            engine.hostname + " (you)",
+            engine.document.text,
+            engine.sorted_peers(),
+        )
+        if len(choices) == 1:
+            # Just us — skip the pick, go straight to the destination prompt.
+            label, content = choices[0]
+            open_dialog(
+                "export " + label + " to: ",
+                lambda s: _do_export(label, content, s),
+            )
+            return
+        listing = "  ".join(
+            str(i + 1) + ":" + label for i, (label, _c) in enumerate(choices)
+        )
+
+        def pick(s: str) -> None:
+            s = s.strip()
+            if not s:
+                set_transient("export cancelled")
+                return
+            try:
+                label, content = choices[int(s) - 1]
+            except (ValueError, IndexError):
+                set_transient("no such block")
+                return
+            open_dialog(
+                "export " + label + " to: ",
+                lambda t: _do_export(label, content, t),
+            )
+
+        open_dialog("export which?  " + listing + "  > ", pick)
+
     # ---- key bindings: every edit goes through the engine (Delta path) ----
     kb = KeyBindings()
     in_doc = ~dialog_active  # document-mode bindings are off while a prompt is open
@@ -645,6 +740,14 @@ def _build(
     @kb.add("c-d", filter=in_doc)
     def _(event: Any) -> None:
         _start_save_attachment()
+
+    @kb.add("c-o", filter=in_doc)
+    def _(event: Any) -> None:
+        open_dialog("open file: ", _do_open)
+
+    @kb.add("c-e", filter=in_doc)
+    def _(event: Any) -> None:
+        _start_export()
 
     # ---- dialog-mode bindings ----
     @kb.add(Keys.Any, filter=dialog_active)

@@ -364,3 +364,72 @@ def test_save_attachment_no_tokens_is_noop(tmp_path):
     e = _engine(tmp_path)
     _drive(e, "hi" + CSAVEATT + "ok" + CQUIT)
     assert e.document.text == "hiok"
+
+
+# ============================ file open / export ============================
+
+COPEN = "\x0f"     # Ctrl-O
+CEXPORT = "\x05"   # Ctrl-E
+
+
+def test_ctrl_o_opens_file_into_block(tmp_path):
+    src = tmp_path / "note.txt"
+    src.write_bytes(b"from disk\r\nline2")  # CRLF: normalization is part of the deal
+    eng = _engine(tmp_path)
+    eng.insert("old text")
+    _drive(eng, COPEN + str(src) + ENTER + CQUIT)
+    assert eng.document.text == "from disk\nline2"
+
+
+def test_ctrl_o_emits_snapshot_not_delta(tmp_path):
+    from netnotepad.protocol import Snapshot
+    src = tmp_path / "note.txt"
+    src.write_text("snap content", encoding="utf-8")
+    eng = _engine(tmp_path)
+    msgs = _record(eng)
+    _drive(eng, COPEN + str(src) + ENTER + CQUIT)
+    assert any(
+        isinstance(m, Snapshot) and m.content == "snap content" for m in msgs
+    )
+
+
+def test_ctrl_o_missing_file_leaves_block_alone(tmp_path):
+    eng = _engine(tmp_path)
+    eng.insert("keep me")
+    _drive(eng, COPEN + str(tmp_path / "nope.txt") + ENTER + CQUIT)
+    assert eng.document.text == "keep me"
+
+
+def test_ctrl_o_empty_enter_cancels(tmp_path):
+    eng = _engine(tmp_path)
+    eng.insert("keep")
+    _drive(eng, COPEN + ENTER + CQUIT)
+    assert eng.document.text == "keep"
+
+
+def test_ctrl_e_no_peers_goes_straight_to_dest_prompt(tmp_path):
+    eng = _engine(tmp_path)
+    eng.insert("export me")
+    dest = tmp_path / "out.txt"
+    _drive(eng, CEXPORT + str(dest) + ENTER + CQUIT)
+    assert dest.read_text(encoding="utf-8") == "export me"
+
+
+def test_ctrl_e_with_peer_numbered_pick_exports_peer_block(tmp_path):
+    eng = _engine(tmp_path)
+    eng.insert("mine")
+    eng.peers["boxB"] = Peer(
+        hostname="boxB", block_text="peer text", has_received_snapshot=True
+    )
+    dest = tmp_path / "rescued.txt"
+    _drive(eng, CEXPORT + "2" + ENTER + str(dest) + ENTER + CQUIT)
+    assert dest.read_text(encoding="utf-8") == "peer text"
+
+
+def test_ctrl_e_directory_dest_gets_default_filename(tmp_path):
+    eng = _engine(tmp_path, name="myhost")
+    eng.insert("dir export")
+    outdir = tmp_path / "outdir"
+    outdir.mkdir()
+    _drive(eng, CEXPORT + str(outdir) + ENTER + CQUIT)
+    assert (outdir / "myhost (you).txt").read_text(encoding="utf-8") == "dir export"

@@ -62,12 +62,13 @@ netnotepad/
     discovery.py         zeroconf register + browse
     network.py           TCP mesh + heartbeat + watchdog + auto-reconnect
     attachments.py       content-addressed blob store + HTTP blob server/fetch
+    fileio.py            File-menu open/export helpers (display-free)
   renderer/
     tk_renderer.py       Tkinter UI
     preview.py           image-preview helpers (display-free)
     term_renderer.py     prompt_toolkit terminal UI (--renderer term)
 
-tests/                   pytest suite, 114 tests
+tests/                   pytest suite, 136 tests
 DESIGN.md                why things are the way they are
 WORKLOG.md               what happened, day by day
 TODO.md                  what's next, what's later, what's verified
@@ -89,6 +90,7 @@ Working and in daily use across Matthew's LAN (laptop, desktop, and a slow box a
 - Reconnect after network blips, reboots, and antivirus tantrums.
 - Graceful offline display with a 5s grace window to avoid flicker.
 - Crash reports written to disk for any unhandled exception.
+- File → Open / Save As in both UIs (Ctrl-O / Ctrl-E in the terminal): open a text file into your block, export your block or any peer's last-known block to a file. Autosave still handles the everyday persistence.
 
 Things that are planned and not yet built (see [`TODO.md`](TODO.md) for the full list):
 
@@ -102,7 +104,7 @@ pip install pytest regex zeroconf prompt_toolkit
 python -m pytest tests/ -q
 ```
 
-37 tests covering the document model, discovery, the TCP mesh end-to-end (two real engines mutually discovering and syncing), the diagnostic logging, and the tombstone grace period.
+136 tests covering the document model, discovery, the TCP mesh end-to-end (two real engines mutually discovering and syncing), the diagnostic logging, and the tombstone grace period.
 
 ## License
 
