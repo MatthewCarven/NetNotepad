@@ -63,6 +63,20 @@ from netnotepad.engine.fileio import (
     read_text_for_open,
     safe_filename,
 )
+from netnotepad.renderer.dnd import parse_drop_paths
+
+# Drag-and-drop is optional. tkinterdnd2 bundles the tkdnd Tcl extension;
+# without it the app runs exactly as before (the Attach button still
+# works), it just won't accept dropped files. We import lazily and never
+# let its absence — or a load failure on an exotic platform — be fatal.
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+
+    _HAS_DND = True
+except Exception:  # ImportError, or tkdnd unavailable for this platform
+    DND_FILES = None
+    TkinterDnD = None
+    _HAS_DND = False
 from netnotepad.log import log_exception, log_info
 from netnotepad.renderer.preview import (
     HAVE_PIL,
@@ -914,4 +928,49 @@ def run(engine: Any) -> None:
         root.after(2000, _periodic_refresh)
 
     root.after(2000, _periodic_refresh)
+
+    # ---------- drag-and-drop: drop files onto the editor to attach ----------
+    # Same end result as the Attach button - engine.attach_file caches the
+    # bytes, broadcasts the offer, and hands back a token we splice into our
+    # block. Tokens land at the current cursor (matching the button) rather
+    # than the drop point; precise drop-position insertion can come later.
+    def _on_drop(event: Any) -> None:
+        paths = parse_drop_paths(getattr(event, "data", "") or "")
+        if not paths:
+            return
+        tokens: list[str] = []
+        skipped = 0
+        for raw in paths:
+            p = Path(raw)
+            if not p.is_file():
+                skipped += 1
+                continue
+            try:
+                _sha, token = engine.attach_file(str(p))
+            except (OSError, ValueError) as e:
+                log_exception(e, context="tk.dnd_attach")
+                set_transient("attach failed: " + str(e))
+                continue
+            tokens.append(token)
+        if tokens:
+            text.insert("insert", " ".join(tokens))
+            _retag_attachments(text, "1.0", text.get("1.0", "end-1c"))
+            refresh_own_previews()
+            msg = f"attached {len(tokens)} file(s) via drop"
+            if skipped:
+                msg += f" ({skipped} skipped)"
+            set_transient(msg)
+        elif skipped:
+            set_transient(f"nothing attached ({skipped} not a file)")
+
+    if _HAS_DND:
+        try:
+            TkinterDnD._require(root)
+            text.drop_target_register(DND_FILES)
+            text.dnd_bind("<<Drop>>", _on_drop)
+        except Exception as e:
+            # A drop-setup failure must never sink the whole UI; log it and
+            # carry on with the Attach button as the only attach path.
+            log_exception(e, context="tk.dnd_setup")
+
     root.mainloop()

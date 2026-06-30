@@ -12,7 +12,7 @@ cd /d %~dp0
 
 echo [1/4] Ensuring build deps are installed...
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet pyinstaller regex zeroconf prompt_toolkit
+python -m pip install --quiet pyinstaller regex zeroconf prompt_toolkit tkinterdnd2
 if errorlevel 1 (
     echo Failed to install build dependencies.
     pause
@@ -39,6 +39,7 @@ python -m PyInstaller ^
     --noconfirm ^
     --collect-all zeroconf ^
     --collect-all prompt_toolkit ^
+    --collect-all tkinterdnd2 ^
     run.py
 if errorlevel 1 (
     echo PyInstaller failed.

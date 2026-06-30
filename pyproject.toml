@@ -11,6 +11,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+# Drag-and-drop file attaching in the Tk UI. Optional: without it the app
+# runs normally, drops are just ignored (the Attach button still works).
+# tkinterdnd2 bundles the tkdnd Tcl extension for win/mac/linux.
+dnd = ["tkinterdnd2>=0.4"]
 
 [project.scripts]
 netnotepad = "netnotepad.__main__:main"

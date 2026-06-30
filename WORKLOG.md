@@ -711,3 +711,86 @@ Verify with py_compile + tests after every file write, trust nothing.
 - `README.md` — layout tree, feature list, test count (136).
 - `TODO.md` / `WORKLOG.md` — this entry; field-run checklist gained the
   File-menu items; commit hand-off updated.
+
+## 2026-06-30 - Drag-and-drop file attaching (Tk)
+
+Drop one or more files onto the Tk editor to attach them - same end result
+as the "Attach file..." button (engine.attach_file caches the bytes,
+broadcasts the AttachmentOffer, returns a token spliced into the block).
+Built on `tkinterdnd2` (bundles the tkdnd Tcl extension), wired as an
+**optional** dependency: if the import fails the app runs exactly as before
+and drops are simply ignored - the Attach button remains the guaranteed
+path. Graceful-degradation mirrors the Pillow-for-extra-image-formats
+pattern already in the codebase.
+
+### Design
+
+- New display-free `netnotepad/renderer/dnd.py`: `parse_drop_paths(data)`.
+  tkdnd hands a `<<Drop>>` event a **Tcl list string** - paths are
+  space-separated and any path containing whitespace is brace-wrapped
+  (`C:\a.png {C:\b c\pic.png} D:\d.txt`). The parser reproduces just enough
+  Tcl list-splitting to handle that, deliberately *not* leaning on
+  `root.tk.splitlist` so the logic is unit-testable headless and behaves
+  identically with or without a live interpreter. Unterminated-brace
+  payloads are salvaged, never raised - a dropped file is not worth a crash.
+- Tk wiring (thin, in `tk_renderer.py`): optional `from tkinterdnd2 import
+  DND_FILES, TkinterDnD` guarded by try/except -> `_HAS_DND`. Kept the root
+  as a plain `tk.Tk()` and upgraded it in place with `TkinterDnD._require(root)`
+  (the `DnDWrapper` mixin patches `tkinter.BaseWidget` at import, so
+  `drop_target_register` / `dnd_bind` exist on every widget once required).
+  The own editor `text` widget is the drop target (you attach into *your*
+  block). `_on_drop` parses the payload, skips non-files, attaches each via
+  `engine.attach_file`, inserts the resulting tokens space-joined at the
+  cursor, then retags + refreshes the own-preview strip. Tokens land at the
+  cursor (matching the button), not the drop point - precise drop-position
+  insertion can come later. Any drop-setup failure is logged and swallowed
+  so a missing/broken tkdnd never sinks the UI.
+- Packaging: `pyproject.toml` gains a `dnd` optional extra; `start.bat` and
+  `build_exe.bat` install `tkinterdnd2` (and `--collect-all tkinterdnd2`
+  so PyInstaller bundles the Tcl extension data); README install + feature
+  + module-tree + test-count refreshed.
+
+### Sandbox file-drift fight (process note)
+
+The Write/Edit <-> bash mount drift bit again, and nastily. The Edit that
+appended the ~46-line DnD tail reported success and the file-tool's own
+Read showed the complete 977-line file - but the bash mount served a file
+**truncated at the edit point**, ending mid-token at `    re` (the start of
+the `refresh_own_previews()` line). The vicious part: `py_compile` *passed*
+on the truncated file, because `    re` is a syntactically valid bare-name
+statement - the truncation happened to land on valid Python, so the usual
+compile check gave a false all-clear. Caught it by scanning the **compiled
+bytecode's string constants** for unique markers (`tk.dnd_setup`,
+`<<Drop>>`): absent => the tail really was gone on disk. Fixed per standing
+procedure - rebuilt the tail with a guarded Python script (anchor on the
+unique `_full_rebuild_peers_view(engine.sorted_peers())` line, assert it
+appears exactly once, re-read from disk to confirm). Lesson sharpened:
+py_compile is necessary but **not sufficient** to prove a tail edit landed;
+verify completeness by a content marker that must exist (grep the string or
+scan co_consts) and that the file ends where it should.
+
+### Verified
+
+- New `tests/test_dnd.py`: 11 tests - empty/whitespace, single bare path,
+  brace-wrapped spaces, multiple mixed, all-braced, POSIX forward-slash,
+  surrounding/collapsed whitespace, internal-space preservation,
+  unterminated-brace salvage, bare-then-unterminated, unicode path.
+- Local-testable suite **136 green** (16 document, 13 logging, 25
+  attachments, 10 network-unit, 41 term, 5 preview, 15 fileio, 11 dnd).
+  The 13 real-mDNS tests still need the LAN. `tk_renderer.py` py_compile
+  clean; bytecode-marker-verified that the DnD tail is genuinely present.
+- Tk wiring itself needs a display + tkdnd - **live verification is
+  Matthew's**: `pip install tkinterdnd2`, then drag a file (and several at
+  once) onto the editor; token(s) appear, peers receive them, image drops
+  show in the own-preview strip; confirm the Attach button still works and
+  that running *without* tkinterdnd2 installed still launches fine.
+
+### Files touched
+
+- `netnotepad/renderer/dnd.py` - new (~45 lines, display-free).
+- `netnotepad/renderer/tk_renderer.py` - optional tkinterdnd2 import +
+  `_on_drop` handler + drop-target registration before `mainloop`.
+- `tests/test_dnd.py` - new, 11 tests.
+- `pyproject.toml` / `start.bat` / `build_exe.bat` / `README.md` - the
+  optional dep + docs.
+- `TODO.md` / `WORKLOG.md` - this entry; drag-and-drop moved to Verified.
