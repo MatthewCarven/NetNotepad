@@ -794,3 +794,64 @@ scan co_consts) and that the file ends where it should.
 - `pyproject.toml` / `start.bat` / `build_exe.bat` / `README.md` - the
   optional dep + docs.
 - `TODO.md` / `WORKLOG.md` - this entry; drag-and-drop moved to Verified.
+
+## 2026-07-02 - Decision: own-pane inline image preview vetoed (won't build)
+
+Closed the "Tk: image preview inside the OWN editable block" item as
+**won't-do** rather than leaving it as open work. It was never blocked on
+effort — it was blocked on being a bad trade, and the two look identical on
+a todo list until you name it.
+
+### Why
+
+The own Text widget's content *is* the document that gets char-offset
+mirrored to peers. `image_create` makes Tk count an embedded image as one
+index position, desyncing the widget-index ↔ model-offset arithmetic that
+keeps peers consistent. Supporting it safely means translating around every
+embedded image on every keystroke — a permanent tax on the hottest edit
+path and a new class of desync bugs.
+
+The reward against that is author-only cosmetics: peers already render
+images inline in the peers pane (2026-06-10), and you already see your own
+attachments in the strip below the pane (v1, 2026-06-10). The only thing
+"true inline" buys is *you* seeing *your own* image at its exact token in
+your own view. Diminishing returns for the sake of an inline embed. Zero
+wire impact either way — peers render their own view independently.
+
+### If it ever comes back
+
+Cheaper, non-invasive routes that sidestep the offset math entirely: click a
+strip thumbnail to jump to its token; hover-over-token preview; or a
+read-only "preview mode" toggle rendered in a separate widget you're not
+editing.
+
+### Files touched
+
+- `TODO.md` - item moved from Up next to Verified as a closed decision.
+- `WORKLOG.md` - this entry.
+
+## 2026-07-02 - Decision: term-renderer image previews vetoed (won't build)
+
+Same call as the own-pane embed, for the same reason: effort wildly out of
+proportion to payoff. A terminal can't display a bitmap portably.
+"Previews" would mean one of:
+
+- non-portable terminal graphics protocols (sixel / kitty) that most of the
+  Windows consoles actually in use don't support; or
+- hand-rolling a bespoke ANSI/ASCII dither down to a constrained palette,
+  plus guessing the host console's cell geometry (font-in-pixels, aspect
+  ratio) to keep the picture from smearing.
+
+Either path is a large, fragile subsystem for a scratchpad's read-only peer
+view. The attachment token already renders highlighted in both panes, and
+Ctrl-D / Save-as already gets the real bytes out to a proper image viewer —
+that's the correct escape hatch, and it's done.
+
+With this closed, TODO Up next holds a single item: Matthew's live
+drag-and-drop LAN verification. Everything else is Later-tier backlog.
+
+### Files touched
+
+- `TODO.md` - term image-preview item moved from Up next to Verified as a
+  closed decision.
+- `WORKLOG.md` - this entry.
